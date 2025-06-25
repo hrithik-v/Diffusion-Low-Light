@@ -1,15 +1,16 @@
 import os
 import time
+import math
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 import utils
-from models.unet import DiffusionUNet
 from models.wavelet import DWT, IWT
 from pytorch_msssim import ssim
 from models.mods import HFRM
+from models.icdt import ICDT, timestep_embedding
 
 
 def data_transform(X):
@@ -115,7 +116,7 @@ class Net(nn.Module):
 
         self.high_enhance0 = HFRM(in_channels=3, out_channels=64)
         self.high_enhance1 = HFRM(in_channels=3, out_channels=64)
-        self.Unet = DiffusionUNet(config)
+        self.ICDT = ICDT(latent_dim=3, img_size=32, patch_size=4)
 
         betas = get_beta_schedule(
             beta_schedule=config.diffusion.beta_schedule,
@@ -147,12 +148,21 @@ class Net(nn.Module):
             at_next = self.compute_alpha(b, next_t.long())
             xt = xs[-1].to(x.device)
 
-            et = self.Unet(torch.cat([x_cond, xt], dim=1), t)
+            t_embed = timestep_embedding(t, 256)
+            et_out = self.ICDT(xt, x_cond, t_embed)
+            et, log_var = torch.chunk(et_out, 2, dim=1)
+
             x0_t = (xt - et * (1 - at).sqrt()) / at.sqrt()
 
-            c1 = eta * ((1 - at / at_next) * (1 - at_next) / (1 - at)).sqrt()
-            c2 = ((1 - at_next) - c1 ** 2).sqrt()
-            xt_next = at_next.sqrt() * x0_t + c1 * torch.randn_like(x) + c2 * et
+            # Use the learned variance. Clamp it for stability.
+            log_var = torch.clamp(log_var, -30.0, 20.0)
+            model_variance = torch.exp(log_var)
+            
+            # To prevent sqrt of negative number, clamp the variance
+            model_variance_clipped = torch.min(model_variance, 1 - at_next)
+
+            c2 = (1 - at_next - model_variance_clipped).sqrt()
+            xt_next = at_next.sqrt() * x0_t + c2 * et + model_variance_clipped.sqrt() * torch.randn_like(x)
             xs.append(xt_next.to(x.device))
 
         return xs[-1]
@@ -190,8 +200,14 @@ class Net(nn.Module):
             gt_LL_dwt = dwt(gt_LL)
             gt_LL_LL, gt_high1 = gt_LL_dwt[:n, ...], gt_LL_dwt[n:, ...]
 
+            # ---------Noise addition----------
             x = gt_LL_LL * a.sqrt() + e * (1.0 - a).sqrt()
-            noise_output = self.Unet(torch.cat([input_LL_LL, x], dim=1), t.float())
+            # ---------Predicted noise----------
+            t_embed = timestep_embedding(t.float(), 256)
+            noise_output_out = self.ICDT(x, input_LL_LL, t_embed)
+            noise_output, _ = torch.chunk(noise_output_out, 2, dim=1)
+
+            # ---------Denoising that added noise to get denoised LL Subbands----------
             denoise_LL_LL = self.sample_training(input_LL_LL, b)
 
             pred_LL = idwt(torch.cat((denoise_LL_LL, input_high1), dim=0))
@@ -220,6 +236,64 @@ class Net(nn.Module):
         return data_dict
 
 
+class VGGPerceptualLoss(nn.Module):
+    def __init__(self, resize=True):
+        super(VGGPerceptualLoss, self).__init__()
+        blocks = []
+        blocks.append(models.vgg19(pretrained=True).features[:4].eval())
+        blocks.append(models.vgg19(pretrained=True).features[4:9].eval())
+        blocks.append(models.vgg19(pretrained=True).features[9:18].eval())
+        blocks.append(models.vgg19(pretrained=True).features[18:27].eval())
+        blocks.append(models.vgg19(pretrained=True).features[27:36].eval())
+        for bl in blocks:
+            for p in bl.parameters():
+                p.requires_grad = False
+        self.blocks = torch.nn.ModuleList(blocks)
+        self.transform = torch.nn.functional.interpolate
+        self.resize = resize
+        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+
+    def forward(self, input, target, feature_layers=[0, 1, 2, 3], style_layers=[]):
+        if input.shape[1] != 3:
+            input = input.repeat(1, 3, 1, 1)
+            target = target.repeat(1, 3, 1, 1)
+        input = (input-self.mean) / self.std
+        target = (target-self.mean) / self.std
+        if self.resize:
+            input = self.transform(input, mode='bilinear', size=(224, 224), align_corners=False)
+            target = self.transform(target, mode='bilinear', size=(224, 224), align_corners=False)
+        loss = 0.0
+        x = input
+        y = target
+        for i, block in enumerate(self.blocks):
+            x = block(x)
+            y = block(y)
+            if i in feature_layers:
+                loss += torch.nn.functional.l1_loss(x, y)
+            if i in style_layers:
+                act_x = x.reshape(x.shape[0], x.shape[1], -1)
+                act_y = y.reshape(y.shape[0], y.shape[1], -1)
+                gram_x = act_x @ act_x.permute(0, 2, 1)
+                gram_y = act_y @ act_y.permute(0, 2, 1)
+                loss += torch.nn.functional.l1_loss(gram_x, gram_y)
+        return loss
+
+
+class ColorLoss(nn.Module):
+    def __init__(self):
+        super(ColorLoss, self).__init__()
+
+    def forward(self, x1, x2):
+        mean_rgb1 = torch.mean(x1, [2, 3], keepdim=True)
+        mean_rgb2 = torch.mean(x2, [2, 3], keepdim=True)
+
+        d_rgb1 = torch.pow(mean_rgb1 - torch.mean(mean_rgb1, 1, keepdim=True), 2)
+        d_rgb2 = torch.pow(mean_rgb2 - torch.mean(mean_rgb2, 1, keepdim=True), 2)
+
+        return torch.sqrt(torch.pow(d_rgb1 - d_rgb2, 2).sum(1)).mean()
+
+
 class DenoisingDiffusion(object):
     def __init__(self, args, config):
         super().__init__()
@@ -236,6 +310,8 @@ class DenoisingDiffusion(object):
 
         self.l2_loss = torch.nn.MSELoss()
         self.l1_loss = torch.nn.L1Loss()
+        self.perceptual_loss = VGGPerceptualLoss().to(self.device)
+        self.color_loss = ColorLoss().to(self.device)
         self.TV_loss = TVLoss()
 
         self.optimizer, self.scheduler = utils.optimize.get_optimizer(self.config, self.model.parameters())
@@ -270,14 +346,17 @@ class DenoisingDiffusion(object):
 
                 output = self.model(x)
 
-                noise_loss, photo_loss, frequency_loss = self.estimation_loss(x, output)
+                noise_loss, photo_loss, frequency_loss, perceptual_loss, color_loss = self.estimation_loss(x, output)
 
-                loss = noise_loss + photo_loss + frequency_loss
+                loss = noise_loss + photo_loss + frequency_loss + 0.5 * perceptual_loss + 0.2 * color_loss
                 if self.step % 10 == 0:
-                    print("step:{}, lr:{:.6f}, noise_loss:{:.4f}, photo_loss:{:.4f}, "
-                          "frequency_loss:{:.4f}".format(self.step, self.scheduler.get_last_lr()[0],
+                    print("step:{}, lr:{:.6f}, loss:{:.4f}, noise:{:.4f}, photo:{:.4f}, "
+                          "freq:{:.4f}, percep:{:.4f}, color:{:.4f}".format(self.step, self.scheduler.get_last_lr()[0],
+                                                         loss.item(),
                                                          noise_loss.item(), photo_loss.item(),
-                                                         frequency_loss.item()))
+                                                         frequency_loss.item(),
+                                                         perceptual_loss.item(),
+                                                         color_loss.item()))
 
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -326,7 +405,13 @@ class DenoisingDiffusion(object):
 
         photo_loss = content_loss + ssim_loss
 
-        return noise_loss, photo_loss, frequency_loss
+        # =============perceptual loss==================
+        perceptual_loss = self.perceptual_loss(pred_x, gt_img)
+
+        # =============color loss==================
+        color_loss = self.color_loss(pred_x, gt_img)
+
+        return noise_loss, photo_loss, frequency_loss, perceptual_loss, color_loss
 
     def sample_validation_patches(self, val_loader, step):
         image_folder = os.path.join(self.args.image_folder, self.config.data.type + str(self.config.data.patch_size))
