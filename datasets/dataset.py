@@ -3,7 +3,6 @@ import torch
 import torch.utils.data
 import PIL
 from PIL import Image
-import re
 from datasets.data_augment import PairCompose, PairRandomCrop, PairToTensor
 
 
@@ -14,11 +13,9 @@ class LLdataset:
     def get_loaders(self):
 
         train_dataset = AllWeatherDataset(os.path.join(self.config.data.data_dir, self.config.data.train_dataset, 'train'),
-                                          patch_size=self.config.data.patch_size,
-                                          filelist='{}_train.txt'.format(self.config.data.train_dataset))
+                                          patch_size=self.config.data.patch_size)
         val_dataset = AllWeatherDataset(os.path.join(self.config.data.data_dir, self.config.data.val_dataset, 'val'),
-                                        patch_size=self.config.data.patch_size,
-                                        filelist='{}_val.txt'.format(self.config.data.val_dataset), train=False)
+                                        patch_size=self.config.data.patch_size, train=False)
 
         train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=self.config.training.batch_size,
                                                    shuffle=True, num_workers=self.config.data.num_workers,
@@ -31,21 +28,19 @@ class LLdataset:
 
 
 class AllWeatherDataset(torch.utils.data.Dataset):
-    def __init__(self, dir, patch_size, filelist=None, train=True):
+    def __init__(self, dir, patch_size, train=True):
         super().__init__()
 
         self.dir = dir
         self.train = train
-        self.file_list = filelist
-        self.train_list = os.path.join(dir, self.file_list)
-        with open(self.train_list) as f:
-            contents = f.readlines()
-            input_names = [i.strip() for i in contents]
-            gt_names = [i.strip().replace('low', 'high') for i in input_names]
-
-        self.input_names = input_names
-        self.gt_names = gt_names
+        self.raw_dir = os.path.join(dir, 'org')
+        self.ref_dir = os.path.join(dir, 'enh')
         self.patch_size = patch_size
+
+        # List all files in raw_dir (assuming all are images)
+        self.input_names = sorted([f for f in os.listdir(self.raw_dir) if os.path.isfile(os.path.join(self.raw_dir, f))])
+        self.gt_names = self.input_names  # Assume same filenames in ref_dir
+
         if self.train:
             self.transforms = PairCompose([
                 PairRandomCrop(self.patch_size),
@@ -57,11 +52,18 @@ class AllWeatherDataset(torch.utils.data.Dataset):
             ])
 
     def get_images(self, index):
-        input_name = self.input_names[index].replace('\n', '')
-        gt_name = self.gt_names[index].replace('\n', '')
-        img_id = re.split('/', input_name)[-1][:-4]
-        input_img = Image.open(os.path.join(self.dir, input_name)) if self.dir else PIL.Image.open(input_name)
-        gt_img = Image.open(os.path.join(self.dir, gt_name)) if self.dir else PIL.Image.open(gt_name)
+        input_name = self.input_names[index]
+        gt_name = self.gt_names[index]
+        img_id = os.path.splitext(input_name)[0]
+        input_img = Image.open(os.path.join(self.raw_dir, input_name))
+        gt_img = Image.open(os.path.join(self.ref_dir, gt_name))
+
+        # Automatically resize images if smaller than patch size
+        min_size = self.patch_size
+        if input_img.width < min_size or input_img.height < min_size:
+            input_img = input_img.resize((max(min_size, input_img.width), max(min_size, input_img.height)), Image.BICUBIC)
+        if gt_img.width < min_size or gt_img.height < min_size:
+            gt_img = gt_img.resize((max(min_size, gt_img.width), max(min_size, gt_img.height)), Image.BICUBIC)
 
         input_img, gt_img = self.transforms(input_img, gt_img)
 

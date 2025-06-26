@@ -11,7 +11,8 @@ from models.wavelet import DWT, IWT
 from pytorch_msssim import ssim
 from models.mods import HFRM
 from models.icdt import ICDT, timestep_embedding
-
+import torchvision.models
+import wandb
 
 def data_transform(X):
     return 2 * X - 1.0
@@ -113,10 +114,14 @@ class Net(nn.Module):
         self.args = args
         self.config = config
         self.device = config.device
+        self.dwt_levels = config.data.dwt_levels
 
-        self.high_enhance0 = HFRM(in_channels=3, out_channels=64)
-        self.high_enhance1 = HFRM(in_channels=3, out_channels=64)
-        self.ICDT = ICDT(latent_dim=3, img_size=32, patch_size=4)
+        self.high_enhancers = nn.ModuleList(
+            [HFRM(in_channels=3, out_channels=64) for _ in range(self.dwt_levels)]
+        )
+        
+        icdt_img_size = config.data.patch_size // (2 ** self.dwt_levels)
+        self.ICDT = ICDT(latent_dim=3, img_size=icdt_img_size, patch_size=4)
 
         betas = get_beta_schedule(
             beta_schedule=config.diffusion.beta_schedule,
@@ -174,62 +179,73 @@ class Net(nn.Module):
         input_img = x[:, :3, :, :]
         n, c, h, w = input_img.shape
         input_img_norm = data_transform(input_img)
-        input_dwt = dwt(input_img_norm)
 
-        input_LL, input_high0 = input_dwt[:n, ...], input_dwt[n:, ...]
+        # DWT Decomposition
+        input_LL = input_img_norm
+        input_highs = []
+        for i in range(self.dwt_levels):
+            input_dwt = dwt(input_LL)
+            input_LL, input_high = input_dwt[:n, ...], input_dwt[n:, ...]
+            input_high = self.high_enhancers[i](input_high)
+            input_highs.append(input_high)
 
-        input_high0 = self.high_enhance0(input_high0)
-
-        input_LL_dwt = dwt(input_LL)
-        input_LL_LL, input_high1 = input_LL_dwt[:n, ...], input_LL_dwt[n:, ...]
-        input_high1 = self.high_enhance1(input_high1)
+        final_LL_input = input_LL
 
         b = self.betas.to(input_img.device)
 
-        t = torch.randint(low=0, high=self.num_timesteps, size=(input_LL_LL.shape[0] // 2 + 1,)).to(self.device)
-        t = torch.cat([t, self.num_timesteps - t - 1], dim=0)[:input_LL_LL.shape[0]].to(x.device)
+        t = torch.randint(low=0, high=self.num_timesteps, size=(final_LL_input.shape[0] // 2 + 1,)).to(self.device)
+        t = torch.cat([t, self.num_timesteps - t - 1], dim=0)[:final_LL_input.shape[0]].to(x.device)
         a = (1 - b).cumprod(dim=0).index_select(0, t).view(-1, 1, 1, 1)
 
-        e = torch.randn_like(input_LL_LL)
+        e = torch.randn_like(final_LL_input)
 
         if self.training:
             gt_img_norm = data_transform(x[:, 3:, :, :])
-            gt_dwt = dwt(gt_img_norm)
-            gt_LL, gt_high0 = gt_dwt[:n, ...], gt_dwt[n:, ...]
-
-            gt_LL_dwt = dwt(gt_LL)
-            gt_LL_LL, gt_high1 = gt_LL_dwt[:n, ...], gt_LL_dwt[n:, ...]
+            
+            # GT DWT Decomposition
+            gt_LL = gt_img_norm
+            gt_highs = []
+            for i in range(self.dwt_levels):
+                gt_dwt = dwt(gt_LL)
+                gt_LL, gt_high = gt_dwt[:n, ...], gt_dwt[n:, ...]
+                gt_highs.append(gt_high)
+            
+            final_gt_LL = gt_LL
 
             # ---------Noise addition----------
-            x = gt_LL_LL * a.sqrt() + e * (1.0 - a).sqrt()
+            x_gt = final_gt_LL * a.sqrt() + e * (1.0 - a).sqrt()
             # ---------Predicted noise----------
             t_embed = timestep_embedding(t.float(), 256)
-            noise_output_out = self.ICDT(x, input_LL_LL, t_embed)
+            noise_output_out = self.ICDT(x_gt, final_LL_input, t_embed)
             noise_output, _ = torch.chunk(noise_output_out, 2, dim=1)
 
             # ---------Denoising that added noise to get denoised LL Subbands----------
-            denoise_LL_LL = self.sample_training(input_LL_LL, b)
+            denoised_LL = self.sample_training(final_LL_input, b)
 
-            pred_LL = idwt(torch.cat((denoise_LL_LL, input_high1), dim=0))
+            # Inverse DWT Reconstruction
+            pred_LL = denoised_LL
+            for i in range(self.dwt_levels - 1, -1, -1):
+                pred_LL = idwt(torch.cat((pred_LL, input_highs[i]), dim=0))
+            
+            pred_x = inverse_data_transform(pred_LL)
 
-            pred_x = idwt(torch.cat((pred_LL, input_high0), dim=0))
-            pred_x = inverse_data_transform(pred_x)
-
-            data_dict["input_high0"] = input_high0
-            data_dict["input_high1"] = input_high1
-            data_dict["gt_high0"] = gt_high0
-            data_dict["gt_high1"] = gt_high1
-            data_dict["pred_LL"] = pred_LL
-            data_dict["gt_LL"] = gt_LL
+            data_dict["input_highs"] = input_highs
+            data_dict["gt_highs"] = gt_highs
+            data_dict["final_gt_LL"] = final_gt_LL
             data_dict["noise_output"] = noise_output
             data_dict["pred_x"] = pred_x
             data_dict["e"] = e
+            data_dict["denoised_LL"] = denoised_LL
 
         else:
-            denoise_LL_LL = self.sample_training(input_LL_LL, b)
-            pred_LL = idwt(torch.cat((denoise_LL_LL, input_high1), dim=0))
-            pred_x = idwt(torch.cat((pred_LL, input_high0), dim=0))
-            pred_x = inverse_data_transform(pred_x)
+            denoised_LL = self.sample_training(final_LL_input, b)
+            
+            # Inverse DWT Reconstruction
+            pred_LL = denoised_LL
+            for i in range(self.dwt_levels - 1, -1, -1):
+                pred_LL = idwt(torch.cat((pred_LL, input_highs[i]), dim=0))
+
+            pred_x = inverse_data_transform(pred_LL)
 
             data_dict["pred_x"] = pred_x
 
@@ -240,11 +256,11 @@ class VGGPerceptualLoss(nn.Module):
     def __init__(self, resize=True):
         super(VGGPerceptualLoss, self).__init__()
         blocks = []
-        blocks.append(models.vgg19(pretrained=True).features[:4].eval())
-        blocks.append(models.vgg19(pretrained=True).features[4:9].eval())
-        blocks.append(models.vgg19(pretrained=True).features[9:18].eval())
-        blocks.append(models.vgg19(pretrained=True).features[18:27].eval())
-        blocks.append(models.vgg19(pretrained=True).features[27:36].eval())
+        blocks.append(torchvision.models.vgg19(pretrained=True).features[:4].eval())
+        blocks.append(torchvision.models.vgg19(pretrained=True).features[4:9].eval())
+        blocks.append(torchvision.models.vgg19(pretrained=True).features[9:18].eval())
+        blocks.append(torchvision.models.vgg19(pretrained=True).features[18:27].eval())
+        blocks.append(torchvision.models.vgg19(pretrained=True).features[27:36].eval())
         for bl in blocks:
             for p in bl.parameters():
                 p.requires_grad = False
@@ -301,16 +317,22 @@ class DenoisingDiffusion(object):
         self.config = config
         self.device = config.device
 
-        self.model = Net(args, config)
-        self.model.to(self.device)
-        self.model = torch.nn.DataParallel(self.model)
+        # Initialize model and move to device
+        self.model = Net(args, config).to(self.device)
+        # Use DataParallel only if multiple GPUs are available
+        if torch.cuda.device_count() > 1:
+            self.model = nn.DataParallel(self.model)
 
         self.ema_helper = EMAHelper()
         self.ema_helper.register(self.model)
 
         self.l2_loss = torch.nn.MSELoss()
         self.l1_loss = torch.nn.L1Loss()
-        self.perceptual_loss = VGGPerceptualLoss().to(self.device)
+        # Use DataParallel for VGGPerceptualLoss if multiple GPUs are available
+        perceptual = VGGPerceptualLoss().to(self.device)
+        if torch.cuda.device_count() > 1:
+            perceptual = nn.DataParallel(perceptual)
+        self.perceptual_loss = perceptual
         self.color_loss = ColorLoss().to(self.device)
         self.TV_loss = TVLoss()
 
@@ -329,6 +351,8 @@ class DenoisingDiffusion(object):
         cudnn.benchmark = True
         train_loader, val_loader = DATASET.get_loaders()
 
+        scaler = torch.amp.GradScaler("cuda")
+
         if os.path.isfile(self.args.resume):
             self.load_ddm_ckpt(self.args.resume)
 
@@ -337,30 +361,46 @@ class DenoisingDiffusion(object):
             data_start = time.time()
             data_time = 0
             for i, (x, y) in enumerate(train_loader):
+                # print(f"x.shape: {x.shape}, y: {y}")
                 x = x.flatten(start_dim=0, end_dim=1) if x.ndim == 5 else x
+                # print(f"Processed x.shape: {x.shape}, y: {y}")
                 data_time += time.time() - data_start
                 self.model.train()
                 self.step += 1
 
                 x = x.to(self.device)
 
-                output = self.model(x)
+                with torch.amp.autocast("cuda"):
+                    output = self.model(x) # [B, 2*C, H, W] for training, [B, C, H, W] for inference
+                    noise_loss, photo_loss, frequency_loss, perceptual_loss, color_loss = self.estimation_loss(x, output)
+                    loss = noise_loss + photo_loss + frequency_loss + 0.5 * perceptual_loss + 0.2 * color_loss
 
-                noise_loss, photo_loss, frequency_loss, perceptual_loss, color_loss = self.estimation_loss(x, output)
-
-                loss = noise_loss + photo_loss + frequency_loss + 0.5 * perceptual_loss + 0.2 * color_loss
                 if self.step % 10 == 0:
                     print("step:{}, lr:{:.6f}, loss:{:.4f}, noise:{:.4f}, photo:{:.4f}, "
                           "freq:{:.4f}, percep:{:.4f}, color:{:.4f}".format(self.step, self.scheduler.get_last_lr()[0],
-                                                         loss.item(),
-                                                         noise_loss.item(), photo_loss.item(),
-                                                         frequency_loss.item(),
-                                                         perceptual_loss.item(),
-                                                         color_loss.item()))
+                                                     loss.item(),
+                                                     noise_loss.item(), photo_loss.item(),
+                                                     frequency_loss.item(),
+                                                     perceptual_loss.item(),
+                                                     color_loss.item()))
+                    # wandb logging
+                    if wandb.run is not None:
+                        wandb.log({
+                            'loss': loss.item(),
+                            'noise_loss': noise_loss.item(),
+                            'photo_loss': photo_loss.item(),
+                            'frequency_loss': frequency_loss.item(),
+                            'perceptual_loss': perceptual_loss.item(),
+                            'color_loss': color_loss.item(),
+                            'lr': self.scheduler.get_last_lr()[0],
+                            'epoch': epoch,
+                            'step': self.step
+                        })
 
                 self.optimizer.zero_grad()
-                loss.backward()
-                self.optimizer.step()
+                scaler.scale(loss).backward()
+                scaler.step(self.optimizer)
+                scaler.update()
                 self.ema_helper.update(self.model)
                 data_start = time.time()
 
@@ -368,36 +408,39 @@ class DenoisingDiffusion(object):
                     self.model.eval()
                     self.sample_validation_patches(val_loader, self.step)
 
-                    utils.logging.save_checkpoint({'step': self.step, 'epoch': epoch + 1,
-                                                   'state_dict': self.model.state_dict(),
-                                                   'optimizer': self.optimizer.state_dict(),
-                                                   'scheduler': self.scheduler.state_dict(),
-                                                   'ema_helper': self.ema_helper.state_dict(),
-                                                   'params': self.args,
-                                                   'config': self.config},
-                                                  filename=os.path.join(self.config.data.ckpt_dir, 'model_latest'))
+            if (epoch+1) % 3 == 0:
+                utils.logging.save_checkpoint({'step': self.step, 'epoch': epoch + 1,
+                                                'state_dict': self.model.state_dict(),
+                                                'optimizer': self.optimizer.state_dict(),
+                                                'scheduler': self.scheduler.state_dict(),
+                                                'ema_helper': self.ema_helper.state_dict(),
+                                                'params': self.args,
+                                                'config': self.config},
+                                                filename=os.path.join(self.config.data.ckpt_dir, str(epoch + 1)))
                         
             self.scheduler.step()
 
     def estimation_loss(self, x, output):
 
-        input_high0, input_high1, gt_high0, gt_high1 = output["input_high0"], output["input_high1"],\
-                                                       output["gt_high0"], output["gt_high1"]
+        input_highs = output["input_highs"]
+        gt_highs = output["gt_highs"]
 
-        pred_LL, gt_LL, pred_x, noise_output, e = output["pred_LL"], output["gt_LL"], output["pred_x"],\
-                                                  output["noise_output"], output["e"]
+        denoised_LL, pred_x, noise_output, e = output["denoised_LL"], output["pred_x"], output["noise_output"], output["e"]
+        final_gt_LL = output["final_gt_LL"]
 
         gt_img = x[:, 3:, :, :].to(self.device)
         # =============noise loss==================
         noise_loss = self.l2_loss(noise_output, e)
 
         # =============frequency loss==================
-        frequency_loss = 0.1 * (self.l2_loss(input_high0, gt_high0) +
-                                self.l2_loss(input_high1, gt_high1) +
-                                self.l2_loss(pred_LL, gt_LL)) +\
-                         0.01 * (self.TV_loss(input_high0) +
-                                 self.TV_loss(input_high1) +
-                                 self.TV_loss(pred_LL))
+        frequency_loss_l2 = self.l2_loss(denoised_LL, final_gt_LL)
+        frequency_loss_tv = self.TV_loss(denoised_LL)
+
+        for i in range(len(input_highs)):
+            frequency_loss_l2 += self.l2_loss(input_highs[i], gt_highs[i])
+            frequency_loss_tv += self.TV_loss(input_highs[i])
+
+        frequency_loss = 0.1 * frequency_loss_l2 + 0.01 * frequency_loss_tv
 
         # =============photo loss==================
         content_loss = self.l1_loss(pred_x, gt_img)

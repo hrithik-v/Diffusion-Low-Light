@@ -11,6 +11,7 @@ def save_image(img, file_directory):
 
 
 def save_checkpoint(state, filename):
+    print("Saving checkpoint to {}".format(filename))
     if not os.path.exists(os.path.dirname(filename)):
         os.makedirs(os.path.dirname(filename))
     torch.save(state, filename + '.pth.tar')

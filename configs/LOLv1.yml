@@ -1,11 +1,12 @@
 data:
     type: "LLdataset"
-    train_dataset: "LOLv1"
-    val_dataset: "LOLv1"
+    train_dataset: "underwater_imagenet"
+    val_dataset: "underwater_imagenet"
     patch_size: 256
     channels: 3
-    num_workers: 4
-    data_dir: "/data/Image_restoration/LL_dataset"
+    dwt_levels: 2
+    num_workers: 0
+    data_dir: "/kaggle/working"
     ckpt_dir: "ckpt/"
     conditional: True
 
@@ -27,7 +28,7 @@ diffusion:
     num_diffusion_timesteps: 200
 
 training:
-    batch_size: 8
+    batch_size: 28
     n_epochs: 500
     validation_freq: 1000
 
@@ -39,3 +40,8 @@ optim:
     eps: 0.00000001
     step_size: 50
     gamma: 0.8
+
+wandb:
+    token: "8285c1e86ba66976957cd9bdbae9e646b37bba8f"
+    name: "diffLL_underwater_imagenet"
+    resume: False

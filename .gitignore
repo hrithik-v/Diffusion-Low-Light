@@ -1,0 +1,5 @@
+wandb
+*/__pycache__/*
+ckpt
+results
+*.ini

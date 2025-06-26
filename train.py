@@ -12,6 +12,9 @@ import models
 import datasets
 import utils
 from models import DenoisingDiffusion
+import wandb
+# import os
+# os.environ["WANDB_MODE"] = "disabled"
 
 
 def parse_args_and_config():
@@ -59,7 +62,18 @@ def main():
     np.random.seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
-    torch.backends.cudnn.benchmark = True
+    # torch.backends.cudnn.benchmark = True
+
+    # wandb login and init
+    if hasattr(config, 'wandb'):
+        wandb.login(key=config.wandb.token)
+        wandb.init(
+            project="UIE_Diffusion",
+            name=getattr(config.wandb, 'name', None),
+            id=getattr(config.wandb, 'id', None),
+            resume=getattr(config.wandb, 'resume', False),
+            config=config
+        )
 
     # data loading
     print("=> using dataset '{}'".format(config.data.train_dataset))
@@ -69,6 +83,9 @@ def main():
     print("=> creating denoising-diffusion model...")
     diffusion = DenoisingDiffusion(args, config)
     diffusion.train(DATASET)
+
+    if hasattr(config, 'wandb'):
+        wandb.finish()
 
 
 if __name__ == "__main__":

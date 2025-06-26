@@ -65,7 +65,7 @@ class DiffusionTransformerBlock(nn.Module):
 # --- Main ICDT Model ---
 
 class ICDT(nn.Module):
-    def __init__(self, latent_dim=3, embed_dim=384, patch_size=4, img_size=32, depth=12, heads=6):
+    def __init__(self, latent_dim=3, embed_dim=192, patch_size=4, img_size=32, depth=6, heads=3):
         super().__init__()
         self.patch_embed = PatchEmbed(in_channels=latent_dim * 2, patch_size=patch_size, emb_dim=embed_dim)
         self.pos_embed = nn.Parameter(torch.randn(1, (img_size // patch_size) ** 2, embed_dim))
@@ -87,11 +87,11 @@ class ICDT(nn.Module):
         self.latent_dim = latent_dim
 
     def forward(self, z_t, z_cond, t):
+        # print(f"z_t shape: {z_t.shape}, z_cond shape: {z_cond.shape}, t shape: {t.shape}")
         x = torch.cat([z_t, z_cond], dim=1)
         x = self.patch_embed(x) + self.pos_embed
 
-        t_embed = timestep_embedding(t, 256)
-        t_embed = self.time_embed(t_embed)
+        t_embed = self.time_embed(t)
 
         for blk in self.blocks:
             x = blk(x, t_embed)
