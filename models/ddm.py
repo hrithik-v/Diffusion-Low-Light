@@ -270,8 +270,8 @@ class VGGPerceptualLoss(nn.Module):
         self.blocks = torch.nn.ModuleList(blocks)
         self.transform = torch.nn.functional.interpolate
         self.resize = resize
-        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
-        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+        self.mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        self.std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
 
     def forward(self, input, target, feature_layers=[0, 1, 2, 3], style_layers=[]):
         if input.shape[1] != 3:
@@ -329,26 +329,27 @@ class DenoisingDiffusion(object):
         self.ema_helper = EMAHelper()
         self.ema_helper.register(self.model)
 
-        # Pre-calculate and register diffusion constants
-        betas = get_beta_schedule(
+        # Pre-calculate diffusion constants for variance loss
+        betas_np = get_beta_schedule(
             beta_schedule=config.diffusion.beta_schedule,
             beta_start=config.diffusion.beta_start,
             beta_end=config.diffusion.beta_end,
             num_diffusion_timesteps=config.diffusion.num_diffusion_timesteps,
         )
-        betas = torch.from_numpy(betas).float().to(self.device)
-        
-        self.register_buffer('betas', betas)
-        self.register_buffer('alphas', 1.0 - self.betas)
-        self.register_buffer('alphas_cumprod', torch.cumprod(self.alphas, dim=0))
-        self.register_buffer('alphas_cumprod_prev', 
-                           torch.cat([torch.ones(1, device=self.device), 
-                                    self.alphas_cumprod[:-1]]))
-        self.register_buffer('posterior_variance',
-                           self.betas * (1. - self.alphas_cumprod_prev) / 
-                           (1. - self.alphas_cumprod))
-        self.register_buffer('log_posterior_variance',
-                           torch.log(self.posterior_variance.clamp(min=1e-20)))
+        self.betas = torch.from_numpy(betas_np).float().to(self.device)
+        self.alphas = 1.0 - self.betas
+        self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
+        self.alphas_cumprod_prev = torch.cat([
+            torch.ones(1, device=self.device),
+            self.alphas_cumprod[:-1]
+        ], dim=0)
+        self.posterior_variance = (
+            self.betas * (1.0 - self.alphas_cumprod_prev) /
+            (1.0 - self.alphas_cumprod)
+        )
+        self.log_posterior_variance = torch.log(
+            self.posterior_variance.clamp(min=1e-20)
+        )
 
         # Loss functions
         self.l2_loss = nn.MSELoss()
