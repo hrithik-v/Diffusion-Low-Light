@@ -13,6 +13,7 @@ from models.mods import HFRM
 from models.icdt import ICDT, timestep_embedding
 import torchvision.models
 import wandb
+from tqdm import tqdm
 
 def data_transform(X):
     return 2 * X - 1.0
@@ -217,7 +218,7 @@ class Net(nn.Module):
             # ---------Predicted noise----------
             t_embed = timestep_embedding(t.float(), 256)
             noise_output_out = self.ICDT(x_gt, final_LL_input, t_embed)
-            noise_output, _ = torch.chunk(noise_output_out, 2, dim=1)
+            noise_output, log_var = torch.chunk(noise_output_out, 2, dim=1)
 
             # ---------Denoising that added noise to get denoised LL Subbands----------
             denoised_LL = self.sample_training(final_LL_input, b)
@@ -236,6 +237,8 @@ class Net(nn.Module):
             data_dict["pred_x"] = pred_x
             data_dict["e"] = e
             data_dict["denoised_LL"] = denoised_LL
+            data_dict["log_var"] = log_var
+            data_dict["t"] = t
 
         else:
             denoised_LL = self.sample_training(final_LL_input, b)
@@ -317,160 +320,199 @@ class DenoisingDiffusion(object):
         self.config = config
         self.device = config.device
 
-        # Initialize model and move to device
+        # Initialize model
         self.model = Net(args, config).to(self.device)
-        # Use DataParallel only if multiple GPUs are available
         if torch.cuda.device_count() > 1:
             self.model = nn.DataParallel(self.model)
 
+        # EMA helper
         self.ema_helper = EMAHelper()
         self.ema_helper.register(self.model)
 
-        self.l2_loss = torch.nn.MSELoss()
-        self.l1_loss = torch.nn.L1Loss()
-        # Use DataParallel for VGGPerceptualLoss if multiple GPUs are available
+        # Pre-calculate and register diffusion constants
+        betas = get_beta_schedule(
+            beta_schedule=config.diffusion.beta_schedule,
+            beta_start=config.diffusion.beta_start,
+            beta_end=config.diffusion.beta_end,
+            num_diffusion_timesteps=config.diffusion.num_diffusion_timesteps,
+        )
+        betas = torch.from_numpy(betas).float().to(self.device)
+        
+        self.register_buffer('betas', betas)
+        self.register_buffer('alphas', 1.0 - self.betas)
+        self.register_buffer('alphas_cumprod', torch.cumprod(self.alphas, dim=0))
+        self.register_buffer('alphas_cumprod_prev', 
+                           torch.cat([torch.ones(1, device=self.device), 
+                                    self.alphas_cumprod[:-1]]))
+        self.register_buffer('posterior_variance',
+                           self.betas * (1. - self.alphas_cumprod_prev) / 
+                           (1. - self.alphas_cumprod))
+        self.register_buffer('log_posterior_variance',
+                           torch.log(self.posterior_variance.clamp(min=1e-20)))
+
+        # Loss functions
+        self.l2_loss = nn.MSELoss()
+        self.l1_loss = nn.L1Loss()
+        
         perceptual = VGGPerceptualLoss().to(self.device)
         if torch.cuda.device_count() > 1:
             perceptual = nn.DataParallel(perceptual)
         self.perceptual_loss = perceptual
+        
         self.color_loss = ColorLoss().to(self.device)
         self.TV_loss = TVLoss()
 
-        self.optimizer, self.scheduler = utils.optimize.get_optimizer(self.config, self.model.parameters())
+        # Optimizer
+        self.optimizer, self.scheduler = utils.optimize.get_optimizer(
+            self.config, self.model.parameters()
+        )
         self.start_epoch, self.step = 0, 0
 
     def load_ddm_ckpt(self, load_path, ema=False):
-        checkpoint = utils.logging.load_checkpoint(load_path, None)
-        self.model.load_state_dict(checkpoint['state_dict'], strict=True)
+        map_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        checkpoint = utils.logging.load_checkpoint(load_path, map_device)
+        
+        state_dict = checkpoint['state_dict']
+        if torch.cuda.device_count() <= 1:
+            state_dict = {k.replace('module.', ''): v 
+                         for k, v in state_dict.items()}
+                         
+        self.model.load_state_dict(state_dict, strict=True)
         self.ema_helper.load_state_dict(checkpoint['ema_helper'])
         if ema:
             self.ema_helper.ema(self.model)
-        print("=> loaded checkpoint {} step {}".format(load_path, self.step))
+        print(f"=> loaded checkpoint {load_path} (step {self.step})")
 
     def train(self, DATASET):
-        cudnn.benchmark = True
         train_loader, val_loader = DATASET.get_loaders()
-
         scaler = torch.amp.GradScaler("cuda")
 
         if os.path.isfile(self.args.resume):
             self.load_ddm_ckpt(self.args.resume)
 
         for epoch in range(self.start_epoch, self.config.training.n_epochs):
-            print('epoch: ', epoch)
-            data_start = time.time()
-            data_time = 0
-            for i, (x, y) in enumerate(train_loader):
-                # print(f"x.shape: {x.shape}, y: {y}")
+            for i, (x, y) in enumerate(tqdm(train_loader, 
+                                           desc=f"Epoch {epoch+1}/{self.config.training.n_epochs}")):
                 x = x.flatten(start_dim=0, end_dim=1) if x.ndim == 5 else x
-                # print(f"Processed x.shape: {x.shape}, y: {y}")
-                data_time += time.time() - data_start
+                x = x.to(self.device)
+                
                 self.model.train()
                 self.step += 1
 
-                x = x.to(self.device)
-
                 with torch.amp.autocast("cuda"):
-                    output = self.model(x) # [B, 2*C, H, W] for training, [B, C, H, W] for inference
-                    noise_loss, photo_loss, frequency_loss, perceptual_loss, color_loss = self.estimation_loss(x, output)
-                    loss = noise_loss + photo_loss + frequency_loss + 0.5 * perceptual_loss + 0.2 * color_loss
+                    output = self.model(x)
+                    losses = self.estimation_loss(x, output)
+                    
+                    # Balanced loss weighting
+                    loss = (
+                        losses['noise'] + losses['photo'] + losses['freq'] +
+                        0.1 * losses['percep'] + 
+                        0.05 * losses['color'] +
+                        0.02 * losses['vlb']  # Increased weight for variance learning
+                    )
 
-                if self.step % 10 == 0:
-                    print("step:{}, lr:{:.6f}, loss:{:.4f}, noise:{:.4f}, photo:{:.4f}, "
-                          "freq:{:.4f}, percep:{:.4f}, color:{:.4f}".format(self.step, self.scheduler.get_last_lr()[0],
-                                                     loss.item(),
-                                                     noise_loss.item(), photo_loss.item(),
-                                                     frequency_loss.item(),
-                                                     perceptual_loss.item(),
-                                                     color_loss.item()))
-                    # wandb logging
-                    if wandb.run is not None:
-                        wandb.log({
-                            'loss': loss.item(),
-                            'noise_loss': noise_loss.item(),
-                            'photo_loss': photo_loss.item(),
-                            'frequency_loss': frequency_loss.item(),
-                            'perceptual_loss': perceptual_loss.item(),
-                            'color_loss': color_loss.item(),
-                            'lr': self.scheduler.get_last_lr()[0],
-                            'epoch': epoch,
-                            'step': self.step
-                        })
+                # Logging
+                if self.step % 20 == 0 and wandb.run is not None:
+                    wandb.log({
+                        **{k: v.item() for k, v in losses.items()},
+                        'lr': self.scheduler.get_last_lr()[0],
+                        'epoch': epoch,
+                        'step': self.step
+                    })
 
+                # Optimize
                 self.optimizer.zero_grad()
                 scaler.scale(loss).backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)  # Gradient clipping
                 scaler.step(self.optimizer)
                 scaler.update()
                 self.ema_helper.update(self.model)
-                data_start = time.time()
 
-                if self.step % self.config.training.validation_freq == 0 and self.step != 0:
-                    self.model.eval()
-                    self.sample_validation_patches(val_loader, self.step)
-
-            if (epoch+1) % 3 == 0:
-                utils.logging.save_checkpoint({'step': self.step, 'epoch': epoch + 1,
-                                                'state_dict': self.model.state_dict(),
-                                                'optimizer': self.optimizer.state_dict(),
-                                                'scheduler': self.scheduler.state_dict(),
-                                                'ema_helper': self.ema_helper.state_dict(),
-                                                'params': self.args,
-                                                'config': self.config},
-                                                filename=os.path.join(self.config.data.ckpt_dir, str(epoch + 1)))
-                        
+            # Validation and checkpointing
+            if (epoch+1) % self.config.data.ckpt_step == 0:
+                self._save_checkpoint(epoch)
             self.scheduler.step()
 
     def estimation_loss(self, x, output):
-
-        input_highs = output["input_highs"]
-        gt_highs = output["gt_highs"]
-
-        denoised_LL, pred_x, noise_output, e = output["denoised_LL"], output["pred_x"], output["noise_output"], output["e"]
-        final_gt_LL = output["final_gt_LL"]
-
         gt_img = x[:, 3:, :, :].to(self.device)
-        # =============noise loss==================
-        noise_loss = self.l2_loss(noise_output, e)
+        
+        # Clamp predicted log variance for stability
+        log_var = torch.clamp(output["log_var"], min=-20, max=20)
+        t = output["t"]
 
-        # =============frequency loss==================
-        frequency_loss_l2 = self.l2_loss(denoised_LL, final_gt_LL)
-        frequency_loss_tv = self.TV_loss(denoised_LL)
+        # Noise loss (L2 on noise prediction)
+        noise_loss = self.l2_loss(output["noise_output"], output["e"])
 
-        for i in range(len(input_highs)):
-            frequency_loss_l2 += self.l2_loss(input_highs[i], gt_highs[i])
-            frequency_loss_tv += self.TV_loss(input_highs[i])
+        # VLB loss (variance learning)
+        true_log_var = self.log_posterior_variance[t].view(-1, 1, 1, 1)
+        kl_div = 0.5 * (-1.0 + (true_log_var - log_var) + 
+                        torch.exp(log_var - true_log_var))
+        vlb_loss = kl_div.mean()
 
-        frequency_loss = 0.1 * frequency_loss_l2 + 0.01 * frequency_loss_tv
+        # Frequency loss
+        freq_l2 = self.l2_loss(output["denoised_LL"], output["final_gt_LL"])
+        freq_tv = self.TV_loss(output["denoised_LL"])
+        
+        for i in range(len(output["input_highs"])):
+            freq_l2 += self.l2_loss(output["input_highs"][i], output["gt_highs"][i])
+            freq_tv += self.TV_loss(output["input_highs"][i])
+            
+        frequency_loss = 0.1 * freq_l2 + 0.01 * freq_tv
 
-        # =============photo loss==================
-        content_loss = self.l1_loss(pred_x, gt_img)
-        ssim_loss = 1 - ssim(pred_x, gt_img, data_range=1.0).to(self.device)
-
+        # Photometric loss
+        content_loss = self.l1_loss(output["pred_x"], gt_img)
+        ssim_loss = 1 - ssim(output["pred_x"], gt_img, data_range=1.0).to(self.device)
         photo_loss = content_loss + ssim_loss
 
-        # =============perceptual loss==================
-        perceptual_loss = self.perceptual_loss(pred_x, gt_img)
+        # Perceptual loss
+        percep_loss = self.perceptual_loss(output["pred_x"], gt_img)
+        if isinstance(percep_loss, torch.Tensor) and percep_loss.dim() > 0:
+            percep_loss = percep_loss.mean()
 
-        # =============color loss==================
-        color_loss = self.color_loss(pred_x, gt_img)
+        # Color loss
+        color_loss = self.color_loss(output["pred_x"], gt_img)
 
-        return noise_loss, photo_loss, frequency_loss, perceptual_loss, color_loss
+        return {
+            'noise': noise_loss,
+            'photo': photo_loss,
+            'freq': frequency_loss,
+            'percep': percep_loss,
+            'color': color_loss,
+            'vlb': vlb_loss
+        }
+
+    def _save_checkpoint(self, epoch):
+        state = {
+            'step': self.step,
+            'epoch': epoch + 1,
+            'state_dict': self.model.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+            'scheduler': self.scheduler.state_dict(),
+            'ema_helper': self.ema_helper.state_dict(),
+            'params': self.args,
+            'config': self.config
+        }
+        ckpt_path = os.path.join(self.config.data.ckpt_dir, str(epoch + 1))
+        utils.logging.save_checkpoint(state, filename=ckpt_path)
 
     def sample_validation_patches(self, val_loader, step):
-        image_folder = os.path.join(self.args.image_folder, self.config.data.type + str(self.config.data.patch_size))
         self.model.eval()
+        image_folder = os.path.join(self.args.image_folder, 
+                                  f"{self.config.data.type}{self.config.data.patch_size}")
+        
         with torch.no_grad():
-            print(f"Processing a single batch of validation images at step: {step}")
             for i, (x, y) in enumerate(val_loader):
-
                 b, _, img_h, img_w = x.shape
-                img_h_32 = int(32 * np.ceil(img_h / 32.0))
-                img_w_32 = int(32 * np.ceil(img_w / 32.0))
-                x = F.pad(x, (0, img_w_32 - img_w, 0, img_h_32 - img_h), 'reflect')
-
+                x = F.pad(x, 
+                         (0, 32 * ((img_w + 31) // 32) - img_w,
+                          0, 32 * ((img_h + 31) // 32) - img_h),
+                         'reflect')
+                
                 out = self.model(x.to(self.device))
-                pred_x = out["pred_x"]
-                pred_x = pred_x[:, :, :img_h, :img_w]
-                utils.logging.save_image(pred_x, os.path.join(image_folder, str(step), f"{y[0]}.png"))
-
-
+                pred_x = out["pred_x"][:, :, :img_h, :img_w]
+                
+                utils.logging.save_image(
+                    pred_x, 
+                    os.path.join(image_folder, str(step), f"{y[0]}.png")
+                )
+                break  # Process only one batch
