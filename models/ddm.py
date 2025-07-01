@@ -277,8 +277,11 @@ class VGGPerceptualLoss(nn.Module):
         if input.shape[1] != 3:
             input = input.repeat(1, 3, 1, 1)
             target = target.repeat(1, 3, 1, 1)
-        input = (input-self.mean) / self.std
-        target = (target-self.mean) / self.std
+        # move mean and std to the same device as inputs
+        mean = self.mean.to(input.device)
+        std = self.std.to(input.device)
+        input = (input - mean) / std
+        target = (target - mean) / std
         if self.resize:
             input = self.transform(input, mode='bilinear', size=(224, 224), align_corners=False)
             target = self.transform(target, mode='bilinear', size=(224, 224), align_corners=False)
