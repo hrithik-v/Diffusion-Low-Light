@@ -70,3 +70,18 @@ class PairToTensor(transforms.ToTensor):
             Tensor: Converted image.
         """
         return F.to_tensor(pic), F.to_tensor(label)
+
+
+class PairResize:
+    """
+    Resize both image and label to a given size.
+    """
+    def __init__(self, size, interpolation=2):  # 2 = BILINEAR in PIL
+        self.size = size
+        # Use BILINEAR interpolation as default (matching PIL.Image.BILINEAR)
+        self.interpolation = interpolation
+
+    def __call__(self, image, label):
+        # Explicitly use the numerical value for interpolation 
+        return F.resize(image, self.size, self.interpolation), \
+               F.resize(label, self.size, self.interpolation)

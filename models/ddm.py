@@ -13,6 +13,7 @@ from models.mods import HFRM
 from models.icdt import ICDT, timestep_embedding
 import torchvision.models
 import wandb
+from tqdm import tqdm
 
 def data_transform(X):
     return 2 * X - 1.0
@@ -348,7 +349,7 @@ class DenoisingDiffusion(object):
         print("=> loaded checkpoint {} step {}".format(load_path, self.step))
 
     def train(self, DATASET):
-        cudnn.benchmark = True
+        # cudnn.benchmark = True
         train_loader, val_loader = DATASET.get_loaders()
 
         scaler = torch.amp.GradScaler("cuda")
@@ -357,10 +358,10 @@ class DenoisingDiffusion(object):
             self.load_ddm_ckpt(self.args.resume)
 
         for epoch in range(self.start_epoch, self.config.training.n_epochs):
-            print('epoch: ', epoch)
+            # print('epoch: ', epoch)
             data_start = time.time()
             data_time = 0
-            for i, (x, y) in enumerate(train_loader):
+            for i, (x, y) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{self.config.training.n_epochs}")):
                 # print(f"x.shape: {x.shape}, y: {y}")
                 x = x.flatten(start_dim=0, end_dim=1) if x.ndim == 5 else x
                 # print(f"Processed x.shape: {x.shape}, y: {y}")
@@ -373,16 +374,36 @@ class DenoisingDiffusion(object):
                 with torch.amp.autocast("cuda"):
                     output = self.model(x) # [B, 2*C, H, W] for training, [B, C, H, W] for inference
                     noise_loss, photo_loss, frequency_loss, perceptual_loss, color_loss = self.estimation_loss(x, output)
-                    loss = noise_loss + photo_loss + frequency_loss + 0.5 * perceptual_loss + 0.2 * color_loss
+                    # Balanced loss weighting (no vlb in old commit)
+                    noise = noise_loss
+                    photo = photo_loss
+                    freq = frequency_loss
+                    percep = perceptual_loss
+                    color = color_loss
+                    if noise is not None and hasattr(noise, 'dim') and noise.dim() > 0:
+                        noise = noise.mean()
+                    if photo is not None and hasattr(photo, 'dim') and photo.dim() > 0:
+                        photo = photo.mean()
+                    if freq is not None and hasattr(freq, 'dim') and freq.dim() > 0:
+                        freq = freq.mean()
+                    if percep is not None and hasattr(percep, 'numel') and percep.numel() > 1:
+                        percep = percep.mean()
+                    if color is not None and hasattr(color, 'dim') and color.dim() > 0:
+                        color = color.mean()
+                    loss = (
+                        noise + photo + freq +
+                        0.1 * percep + 
+                        0.05 * color
+                    )
 
                 if self.step % 10 == 0:
-                    print("step:{}, lr:{:.6f}, loss:{:.4f}, noise:{:.4f}, photo:{:.4f}, "
-                          "freq:{:.4f}, percep:{:.4f}, color:{:.4f}".format(self.step, self.scheduler.get_last_lr()[0],
-                                                     loss.item(),
-                                                     noise_loss.item(), photo_loss.item(),
-                                                     frequency_loss.item(),
-                                                     perceptual_loss.item(),
-                                                     color_loss.item()))
+                    # print("step:{}, lr:{:.6f}, loss:{:.4f}, noise:{:.4f}, photo:{:.4f}, "
+                    #       "freq:{:.4f}, percep:{:.4f}, color:{:.4f}".format(self.step, self.scheduler.get_last_lr()[0],
+                    #                                  loss.item(),
+                    #                                  noise_loss.item(), photo_loss.item(),
+                    #                                  frequency_loss.item(),
+                    #                                  percep.item(),
+                    #                                  color_loss.item()))
                     # wandb logging
                     if wandb.run is not None:
                         wandb.log({
@@ -390,7 +411,7 @@ class DenoisingDiffusion(object):
                             'noise_loss': noise_loss.item(),
                             'photo_loss': photo_loss.item(),
                             'frequency_loss': frequency_loss.item(),
-                            'perceptual_loss': perceptual_loss.item(),
+                            'perceptual_loss': percep.item(),
                             'color_loss': color_loss.item(),
                             'lr': self.scheduler.get_last_lr()[0],
                             'epoch': epoch,
@@ -404,9 +425,9 @@ class DenoisingDiffusion(object):
                 self.ema_helper.update(self.model)
                 data_start = time.time()
 
-                if self.step % self.config.training.validation_freq == 0 and self.step != 0:
-                    self.model.eval()
-                    self.sample_validation_patches(val_loader, self.step)
+                # if self.step % self.config.training.validation_freq == 0 and self.step != 0:
+                #     self.model.eval()
+                #     self.sample_validation_patches(val_loader, self.step)
 
             if (epoch+1) % 3 == 0:
                 utils.logging.save_checkpoint({'step': self.step, 'epoch': epoch + 1,
@@ -457,20 +478,22 @@ class DenoisingDiffusion(object):
         return noise_loss, photo_loss, frequency_loss, perceptual_loss, color_loss
 
     def sample_validation_patches(self, val_loader, step):
-        image_folder = os.path.join(self.args.image_folder, self.config.data.type + str(self.config.data.patch_size))
         self.model.eval()
+        image_folder = os.path.join(self.args.image_folder, 
+                                  f"{self.config.data.type}{self.config.data.patch_size}")
         with torch.no_grad():
-            print(f"Processing a single batch of validation images at step: {step}")
             for i, (x, y) in enumerate(val_loader):
-
                 b, _, img_h, img_w = x.shape
-                img_h_32 = int(32 * np.ceil(img_h / 32.0))
-                img_w_32 = int(32 * np.ceil(img_w / 32.0))
-                x = F.pad(x, (0, img_w_32 - img_w, 0, img_h_32 - img_h), 'reflect')
-
+                x = F.pad(x, 
+                         (0, 32 * ((img_w + 31) // 32) - img_w,
+                          0, 32 * ((img_h + 31) // 32) - img_h),
+                         'reflect')
                 out = self.model(x.to(self.device))
-                pred_x = out["pred_x"]
-                pred_x = pred_x[:, :, :img_h, :img_w]
-                utils.logging.save_image(pred_x, os.path.join(image_folder, str(step), f"{y[0]}.png"))
+                pred_x = out["pred_x"][:, :, :img_h, :img_w]
+                utils.logging.save_image(
+                    pred_x, 
+                    os.path.join(image_folder, str(step), f"{y[0]}.png")
+                )
+                break  # Process only one batch
 
 

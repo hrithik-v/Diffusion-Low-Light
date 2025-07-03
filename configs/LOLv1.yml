@@ -1,12 +1,12 @@
 data:
     type: "LLdataset"
-    train_dataset: "underwater_imagenet"
-    val_dataset: "underwater_imagenet"
+    train_dataset: "LSUI"
+    val_dataset: "LSUI"
     patch_size: 256
     channels: 3
     dwt_levels: 2
     num_workers: 0
-    data_dir: "/kaggle/working"
+    data_dir: "/home/mlr/nihal/underwater/image_dirs"
     ckpt_dir: "ckpt/"
     conditional: True
 
@@ -28,7 +28,7 @@ diffusion:
     num_diffusion_timesteps: 200
 
 training:
-    batch_size: 28
+    batch_size: 42
     n_epochs: 500
     validation_freq: 1000
 
@@ -43,5 +43,6 @@ optim:
 
 wandb:
     token: "8285c1e86ba66976957cd9bdbae9e646b37bba8f"
-    name: "diffLL_underwater_imagenet"
-    resume: False
+    name: "diffLL_LSUI"
+    resume: true
+    id: '438gg6ln'

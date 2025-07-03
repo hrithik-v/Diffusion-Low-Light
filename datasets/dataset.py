@@ -3,7 +3,7 @@ import torch
 import torch.utils.data
 import PIL
 from PIL import Image
-from datasets.data_augment import PairCompose, PairRandomCrop, PairToTensor
+from datasets.data_augment import PairCompose, PairRandomCrop, PairToTensor, PairResize
 
 
 class LLdataset:
@@ -33,8 +33,8 @@ class AllWeatherDataset(torch.utils.data.Dataset):
 
         self.dir = dir
         self.train = train
-        self.raw_dir = os.path.join(dir, 'org')
-        self.ref_dir = os.path.join(dir, 'enh')
+        self.raw_dir = os.path.join(dir, 'raw')
+        self.ref_dir = os.path.join(dir, 'ref')
         self.patch_size = patch_size
 
         # List all files in raw_dir (assuming all are images)
@@ -47,7 +47,9 @@ class AllWeatherDataset(torch.utils.data.Dataset):
                 PairToTensor()
             ])
         else:
+            # Resize validation images to patch_size instead of cropping
             self.transforms = PairCompose([
+                PairResize((self.patch_size, self.patch_size)),
                 PairToTensor()
             ])
 
