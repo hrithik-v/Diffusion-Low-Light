@@ -2,4 +2,5 @@ wandb
 */__pycache__/*
 ckpt
 results
-*.ini
+samples
+*.ini*.patch

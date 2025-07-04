@@ -24,7 +24,7 @@ def load_config(config_path):
         config = yaml.safe_load(f)
     return dict2namespace(config)
 
-def save_grid(org_imgs, gt_imgs, gen_imgs, n, out_path):
+def save_grid(org_imgs, gt_imgs, gen_imgs, n, out_path, ckpt_step):
     import imageio
     import os
     os.makedirs(out_path, exist_ok=True)
@@ -38,14 +38,20 @@ def save_grid(org_imgs, gt_imgs, gen_imgs, n, out_path):
         rows.append(row)
     grid = np.concatenate(rows, axis=0)  # Stack rows vertically
     grid = (grid * 255).astype(np.uint8)
-    imageio.imwrite(os.path.join(out_path, 'samples_grid_test_2.png'), grid)
+    imageio.imwrite(os.path.join(out_path, f'{ckpt_step}.png'), grid)
+
 
 def main():
     parser = argparse.ArgumentParser(description="Inference and visualization for DenoisingDiffusion")
     parser.add_argument("--config", type=str, default="configs/LOLv1.yml", help="Path to config YAML file")
-    parser.add_argument("--ckpt", type=str, default="ckpt/258.pth.tar", help="Path to checkpoint file")
+    parser.add_argument("--run_name", type=str, default="2nd_run", help="Name of the run (used for ckpt and output dir)")
+    parser.add_argument("--ckpt_step", type=str, default="180", help="Checkpoint step (used for ckpt filename)")
     parser.add_argument("--num_samples", type=int, default=5, help="Number of samples to visualize")
     args = parser.parse_args()
+
+    # Construct ckpt path and output dir from run_name and ckpt_step
+    args.ckpt = f"ckpt/{args.run_name}/{args.ckpt_step}.pth.tar"
+    output_dir = f"samples/{args.run_name}"
 
     config = load_config(args.config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -94,8 +100,8 @@ def main():
         gen_imgs.append(np.transpose(pred_x, (1,2,0)))
 
     # make directory if not exist
-    os.makedirs("./samples/", exist_ok=True)
-    save_grid(org_imgs, gt_imgs, gen_imgs, args.num_samples, out_path="./samples/")
+    os.makedirs(output_dir, exist_ok=True)
+    save_grid(org_imgs, gt_imgs, gen_imgs, args.num_samples, out_path=output_dir, ckpt_step=args.ckpt_step)
 
 if __name__ == "__main__":
     main()

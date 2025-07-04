@@ -155,20 +155,14 @@ class Net(nn.Module):
             xt = xs[-1].to(x.device)
 
             t_embed = timestep_embedding(t, 256)
-            et_out = self.ICDT(xt, x_cond, t_embed)
-            et, log_var = torch.chunk(et_out, 2, dim=1)
+            et = self.ICDT(xt, x_cond, t_embed)
 
             x0_t = (xt - et * (1 - at).sqrt()) / at.sqrt()
 
-            # Use the learned variance. Clamp it for stability.
-            log_var = torch.clamp(log_var, -30.0, 20.0)
-            model_variance = torch.exp(log_var)
-            
-            # To prevent sqrt of negative number, clamp the variance
-            model_variance_clipped = torch.min(model_variance, 1 - at_next)
-
-            c2 = (1 - at_next - model_variance_clipped).sqrt()
-            xt_next = at_next.sqrt() * x0_t + c2 * et + model_variance_clipped.sqrt() * torch.randn_like(x)
+            # DDIM sampling with fixed variance
+            c1 = eta * ((1 - at / at_next) * (1 - at_next) / (1 - at)).sqrt()
+            c2 = ((1 - at_next) - c1 ** 2).sqrt()
+            xt_next = at_next.sqrt() * x0_t + c1 * torch.randn_like(x) + c2 * et
             xs.append(xt_next.to(x.device))
 
         return xs[-1]
@@ -217,8 +211,7 @@ class Net(nn.Module):
             x_gt = final_gt_LL * a.sqrt() + e * (1.0 - a).sqrt()
             # ---------Predicted noise----------
             t_embed = timestep_embedding(t.float(), 256)
-            noise_output_out = self.ICDT(x_gt, final_LL_input, t_embed)
-            noise_output, _ = torch.chunk(noise_output_out, 2, dim=1)
+            noise_output = self.ICDT(x_gt, final_LL_input, t_embed)
 
             # ---------Denoising that added noise to get denoised LL Subbands----------
             denoised_LL = self.sample_training(final_LL_input, b)
@@ -429,7 +422,7 @@ class DenoisingDiffusion(object):
                 #     self.model.eval()
                 #     self.sample_validation_patches(val_loader, self.step)
 
-            if (epoch+1) % 3 == 0:
+            if (epoch+1) % 20 == 0:
                 utils.logging.save_checkpoint({'step': self.step, 'epoch': epoch + 1,
                                                 'state_dict': self.model.state_dict(),
                                                 'optimizer': self.optimizer.state_dict(),

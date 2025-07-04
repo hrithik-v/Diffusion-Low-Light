@@ -81,7 +81,7 @@ class ICDT(nn.Module):
         ])
 
         self.final_norm = nn.LayerNorm(embed_dim)
-        self.out_proj = nn.Linear(embed_dim, patch_size * patch_size * latent_dim * 2)
+        self.out_proj = nn.Linear(embed_dim, patch_size * patch_size * latent_dim)
         self.patch_size = patch_size
         self.img_size = img_size
         self.latent_dim = latent_dim
@@ -100,7 +100,7 @@ class ICDT(nn.Module):
         x = self.out_proj(x)
         x = rearrange(x, 'b (h w) (p1 p2 c) -> b c (h p1) (w p2)',
                       h=self.img_size // self.patch_size, w=self.img_size // self.patch_size,
-                      p1=self.patch_size, p2=self.patch_size, c=self.latent_dim * 2)
+                      p1=self.patch_size, p2=self.patch_size, c=self.latent_dim)
         return x
 
 def timestep_embedding(timesteps, dim, max_period=10000):
