@@ -301,7 +301,7 @@ class ColorLoss(nn.Module):
         d_rgb1 = torch.pow(mean_rgb1 - torch.mean(mean_rgb1, 1, keepdim=True), 2)
         d_rgb2 = torch.pow(mean_rgb2 - torch.mean(mean_rgb2, 1, keepdim=True), 2)
 
-        return torch.sqrt(torch.pow(d_rgb1 - d_rgb2, 2).sum(1)).mean()
+        return torch.sqrt(torch.pow(d_rgb1 - d_rgb2, 2).sum(1) + 1e-6).mean()
 
 
 class DenoisingDiffusion(object):
@@ -383,6 +383,12 @@ class DenoisingDiffusion(object):
                         percep = percep.mean()
                     if color is not None and hasattr(color, 'dim') and color.dim() > 0:
                         color = color.mean()
+                    # Check for NaN values and skip if found
+                    if torch.isnan(loss) or torch.isinf(loss):
+                        print(f"Warning: NaN or Inf detected in loss at step {self.step}")
+                        print(f"noise: {noise.item()}, photo: {photo.item()}, freq: {freq.item()}, percep: {percep.item()}, color: {color.item()}")
+                        continue
+                        
                     loss = (
                         noise + photo + freq +
                         0.1 * percep + 
@@ -413,6 +419,11 @@ class DenoisingDiffusion(object):
 
                 self.optimizer.zero_grad()
                 scaler.scale(loss).backward()
+                
+                # Add gradient clipping to prevent exploding gradients
+                scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                
                 scaler.step(self.optimizer)
                 scaler.update()
                 self.ema_helper.update(self.model)
@@ -454,11 +465,15 @@ class DenoisingDiffusion(object):
             frequency_loss_l2 += self.l2_loss(input_highs[i], gt_highs[i])
             frequency_loss_tv += self.TV_loss(input_highs[i])
 
+        # Normalize TV loss by number of high-frequency components
+        # frequency_loss_tv = frequency_loss_tv / (len(input_highs) + 1)
         frequency_loss = 0.1 * frequency_loss_l2 + 0.01 * frequency_loss_tv
 
         # =============photo loss==================
         content_loss = self.l1_loss(pred_x, gt_img)
         ssim_loss = 1 - ssim(pred_x, gt_img, data_range=1.0).to(self.device)
+        if ssim_loss < 0 or ssim_loss > 1:
+            print(f"Warning: SSIM loss value out of [0,1] range: {ssim_loss.item()}")
 
         photo_loss = content_loss + ssim_loss
 
