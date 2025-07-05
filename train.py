@@ -23,7 +23,7 @@ def parse_args_and_config():
                         help="Path to the config file")
     parser.add_argument('--resume', default='', type=str,
                         help='Path for checkpoint to load and resume')
-    parser.add_argument("--sampling_timesteps", type=int, default=10,
+    parser.add_argument("--sampling_timesteps", type=int, default=40,
                         help="Number of implicit sampling steps for validation image patches")
     parser.add_argument("--image_folder", default='results/', type=str,
                         help="Location to save restored validation image patches")

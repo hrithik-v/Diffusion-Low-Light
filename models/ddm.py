@@ -383,17 +383,17 @@ class DenoisingDiffusion(object):
                         percep = percep.mean()
                     if color is not None and hasattr(color, 'dim') and color.dim() > 0:
                         color = color.mean()
+                        
+                    loss = (
+                        noise + photo + freq +
+                        0.2 * percep + 
+                        0.05 * color
+                    )
                     # Check for NaN values and skip if found
                     if torch.isnan(loss) or torch.isinf(loss):
                         print(f"Warning: NaN or Inf detected in loss at step {self.step}")
                         print(f"noise: {noise.item()}, photo: {photo.item()}, freq: {freq.item()}, percep: {percep.item()}, color: {color.item()}")
                         continue
-                        
-                    loss = (
-                        noise + photo + freq +
-                        0.1 * percep + 
-                        0.05 * color
-                    )
 
                 if self.step % 10 == 0:
                     # print("step:{}, lr:{:.6f}, loss:{:.4f}, noise:{:.4f}, photo:{:.4f}, "
@@ -419,10 +419,12 @@ class DenoisingDiffusion(object):
 
                 self.optimizer.zero_grad()
                 scaler.scale(loss).backward()
-                
-                # Add gradient clipping to prevent exploding gradients
-                scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+
+                # Compute total gradient norm before clipping
+                # scaler.unscale_(self.optimizer)
+                # total_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                # if total_norm > 1.0:
+                #     print(f"Warning: Gradient norm ({total_norm:.4f}) exceeded max_norm before clipping at step {self.step}")
                 
                 scaler.step(self.optimizer)
                 scaler.update()
@@ -433,7 +435,7 @@ class DenoisingDiffusion(object):
                 #     self.model.eval()
                 #     self.sample_validation_patches(val_loader, self.step)
 
-            if (epoch+1) % 20 == 0:
+            if (epoch+1) % 25 == 0:
                 utils.logging.save_checkpoint({'step': self.step, 'epoch': epoch + 1,
                                                 'state_dict': self.model.state_dict(),
                                                 'optimizer': self.optimizer.state_dict(),
@@ -471,10 +473,16 @@ class DenoisingDiffusion(object):
 
         # =============photo loss==================
         content_loss = self.l1_loss(pred_x, gt_img)
-        ssim_loss = 1 - ssim(pred_x, gt_img, data_range=1.0).to(self.device)
-        if ssim_loss < 0 or ssim_loss > 1:
-            print(f"Warning: SSIM loss value out of [0,1] range: {ssim_loss.item()}")
+        if content_loss < 0 or content_loss > 1:
+            print(f"Warning: Content loss value out of [0,1] range: {content_loss.item()}")
+            print(f"pred_x: {pred_x.min().item()} to {pred_x.max().item()}, mean: {pred_x.mean().item()}, var: {pred_x.var().item()}")
 
+        ssim_val = ssim(pred_x, gt_img, data_range=1.0).to(self.device)
+        if ssim_val < 0 or ssim_val > 1:
+            print(f"Warning: SSIM loss value out of [0,1] range: {ssim_val.item()}")
+            print(f"pred_x: {pred_x.min().item()} to {pred_x.max().item()}, mean: {pred_x.mean().item()}, var: {pred_x.var().item()}")
+        
+        ssim_loss = 1 - torch.clamp(ssim_val, min=0, max=1)
         photo_loss = content_loss + ssim_loss
 
         # =============perceptual loss==================
