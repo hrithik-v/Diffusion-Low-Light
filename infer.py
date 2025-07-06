@@ -46,7 +46,8 @@ def main():
     parser.add_argument("--config", type=str, default="configs/LOLv1.yml", help="Path to config YAML file")
     parser.add_argument("--run_name", type=str, default="2nd_run", help="Name of the run (used for ckpt and output dir)")
     parser.add_argument("--ckpt_step", type=str, default="180", help="Checkpoint step (used for ckpt filename)")
-    parser.add_argument("--num_samples", type=int, default=5, help="Number of samples to visualize")
+    parser.add_argument("--num_samples", type=int, default=8, help="Number of samples to visualize")
+    parser.add_argument("--sampling_timesteps", type=int, default=40)
     args = parser.parse_args()
 
     # Construct ckpt path and output dir from run_name and ckpt_step
@@ -56,10 +57,6 @@ def main():
     config = load_config(args.config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     config.device = device
-
-    # Ensure args has sampling_timesteps for model
-    if not hasattr(args, 'sampling_timesteps'):
-        args.sampling_timesteps = getattr(config, 'sampling_timesteps', 10)
 
     # Load dataset
     DATASET = datasets.__dict__[config.data.type](config)

@@ -52,7 +52,7 @@ class EMAHelper(object):
             module = module.module
         for name, param in module.named_parameters():
             if param.requires_grad:
-                self.shadow[name] = param.data.clone()
+                self.shadow[name] = param.data.clone().to(param.device)
 
     def update(self, module):
         if isinstance(module, nn.DataParallel):
@@ -83,7 +83,15 @@ class EMAHelper(object):
     def state_dict(self):
         return self.shadow
 
-    def load_state_dict(self, state_dict):
+    def load_state_dict(self, state_dict, model):
+        if isinstance(model, nn.DataParallel):
+            model = model.module
+        
+        # Move shadow params to the same device as model params
+        for name, param in model.named_parameters():
+            if name in state_dict:
+                state_dict[name] = state_dict[name].to(param.device)
+
         self.shadow = state_dict
 
 
@@ -336,10 +344,19 @@ class DenoisingDiffusion(object):
     def load_ddm_ckpt(self, load_path, ema=False):
         checkpoint = utils.logging.load_checkpoint(load_path, None)
         self.model.load_state_dict(checkpoint['state_dict'], strict=True)
-        self.ema_helper.load_state_dict(checkpoint['ema_helper'])
+        self.ema_helper.load_state_dict(checkpoint['ema_helper'], self.model)
+        self.optimizer.load_state_dict(checkpoint['optimizer'])
+        self.scheduler.load_state_dict(checkpoint['scheduler'])
+        # Restore epoch and step if present in checkpoint
+        if 'epoch' in checkpoint:
+            self.start_epoch = checkpoint['epoch']
+        if 'step' in checkpoint:
+            self.step = checkpoint['step']
+        # if 'optimizer' in checkpoint:
+        # if 'scheduler' in checkpoint:
         if ema:
             self.ema_helper.ema(self.model)
-        print("=> loaded checkpoint {} step {}".format(load_path, self.step))
+        print("=> loaded checkpoint {} step {} epoch {}".format(load_path, self.step, getattr(self, 'start_epoch', 0)))
 
     def train(self, DATASET):
         # cudnn.benchmark = True
