@@ -25,16 +25,32 @@ def load_config(config_path):
     return dict2namespace(config)
 
 def save_grid(org_imgs, gt_imgs, gen_imgs, n, out_path, ckpt_step):
-    import imageio
-    import os
+    import imageio, os, cv2  # noqa: F401
+    from skimage.metrics import peak_signal_noise_ratio, structural_similarity
     os.makedirs(out_path, exist_ok=True)
     rows = []
     for i in range(n):
-        row = np.concatenate([
-            np.clip(org_imgs[i], 0, 1),
-            np.clip(gt_imgs[i], 0, 1),
-            np.clip(gen_imgs[i], 0, 1)
-        ], axis=1)
+        orig = np.clip(org_imgs[i], 0, 1)
+        gt = np.clip(gt_imgs[i], 0, 1)
+        gen = np.clip(gen_imgs[i], 0, 1)
+        # Compute PSNR and SSIM between gt and generated
+        psnr = peak_signal_noise_ratio(gt, gen, data_range=1.0)
+        ssim = structural_similarity(gt, gen, data_range=1.0, channel_axis=2)
+        # Create a blank annotation image
+        H, W, _ = gt.shape
+        blank_uint = np.ones((H, W, 3), dtype=np.uint8) * 255
+        text = f"PSNR:{psnr:.2f} SSIM:{ssim:.4f}"
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.6
+        thickness = 1
+        text_size, _ = cv2.getTextSize(text, font, font_scale, thickness)
+        text_w, text_h = text_size
+        org_x = max((W - text_w) // 2, 0)
+        org_y = max((H + text_h) // 2, text_h)
+        cv2.putText(blank_uint, text, (org_x, org_y), font, font_scale, (0, 0, 0), thickness, cv2.LINE_AA)
+        blank = blank_uint.astype(np.float32) / 255.0
+        # Concatenate original, gt, generated, and metrics images
+        row = np.concatenate([orig, gt, gen, blank], axis=1)
         rows.append(row)
     grid = np.concatenate(rows, axis=0)  # Stack rows vertically
     grid = (grid * 255).astype(np.uint8)

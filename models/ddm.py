@@ -452,7 +452,16 @@ class DenoisingDiffusion(object):
                 #     self.model.eval()
                 #     self.sample_validation_patches(val_loader, self.step)
 
-            if (epoch+1) % 25 == 0:
+            if (epoch+1) % 4 == 0:
+                utils.logging.save_checkpoint({'step': self.step, 'epoch': epoch + 1,
+                                                'state_dict': self.model.state_dict(),
+                                                'optimizer': self.optimizer.state_dict(),
+                                                'scheduler': self.scheduler.state_dict(),
+                                                'ema_helper': self.ema_helper.state_dict(),
+                                                'params': self.args,
+                                                'config': self.config},
+                                                filename=os.path.join(self.config.data.ckpt_dir, "latest"))
+            if (epoch+1) % 50 == 0:
                 utils.logging.save_checkpoint({'step': self.step, 'epoch': epoch + 1,
                                                 'state_dict': self.model.state_dict(),
                                                 'optimizer': self.optimizer.state_dict(),
