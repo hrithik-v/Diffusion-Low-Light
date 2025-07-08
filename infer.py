@@ -64,6 +64,7 @@ def main():
     parser.add_argument("--ckpt_step", type=str, default="180", help="Checkpoint step (used for ckpt filename)")
     parser.add_argument("--num_samples", type=int, default=8, help="Number of samples to visualize")
     parser.add_argument("--sampling_timesteps", type=int, default=40)
+    parser.add_argument("--seed", type=int, default=None, help="Manual seed for reproducibility (default: None, uses system time)")
     args = parser.parse_args()
 
     # Construct ckpt path and output dir from run_name and ckpt_step
@@ -96,7 +97,10 @@ def main():
     # Randomly select indices for sampling
     val_dataset = val_loader.dataset
     total = len(val_dataset)
-    np.random.seed()  # Use system time or OS entropy
+    if args.seed is not None:
+        np.random.seed(args.seed)
+    else:
+        np.random.seed()  # Use system time or OS entropy
     sample_indices = np.random.choice(total, size=args.num_samples, replace=False)
 
     org_imgs, gt_imgs, gen_imgs = [], [], []
