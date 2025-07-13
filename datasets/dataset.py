@@ -12,9 +12,9 @@ class LLdataset:
 
     def get_loaders(self):
 
-        train_dataset = AllWeatherDataset(os.path.join(self.config.data.data_dir, self.config.data.train_dataset, 'train'),
+        train_dataset = AllWeatherDataset(os.path.join(self.config.data.data_dir, self.config.data.train_dataset),
                                           patch_size=self.config.data.patch_size)
-        val_dataset = AllWeatherDataset(os.path.join(self.config.data.data_dir, self.config.data.val_dataset, 'val'),
+        val_dataset = AllWeatherDataset(os.path.join(self.config.data.data_dir, self.config.data.val_dataset),
                                         patch_size=self.config.data.patch_size, train=False)
 
         train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=self.config.training.batch_size,
@@ -33,8 +33,8 @@ class AllWeatherDataset(torch.utils.data.Dataset):
 
         self.dir = dir
         self.train = train
-        self.raw_dir = os.path.join(dir, 'raw')
-        self.ref_dir = os.path.join(dir, 'ref')
+        self.raw_dir = os.path.join(dir, 'input')
+        self.ref_dir = os.path.join(dir, 'GT')
         self.patch_size = patch_size
 
         # List all files in raw_dir (assuming all are images)
@@ -49,7 +49,7 @@ class AllWeatherDataset(torch.utils.data.Dataset):
         else:
             # Resize validation images to patch_size instead of cropping
             self.transforms = PairCompose([
-                PairResize((self.patch_size, self.patch_size)),
+                # PairResize((self.patch_size, self.patch_size)),
                 PairToTensor()
             ])
 
@@ -57,8 +57,8 @@ class AllWeatherDataset(torch.utils.data.Dataset):
         input_name = self.input_names[index]
         gt_name = self.gt_names[index]
         img_id = os.path.splitext(input_name)[0]
-        input_img = Image.open(os.path.join(self.raw_dir, input_name))
-        gt_img = Image.open(os.path.join(self.ref_dir, gt_name))
+        input_img = Image.open(os.path.join(self.raw_dir, input_name)).convert('RGB')
+        gt_img = Image.open(os.path.join(self.ref_dir, gt_name)).convert('RGB')
 
         # Automatically resize images if smaller than patch size
         min_size = self.patch_size

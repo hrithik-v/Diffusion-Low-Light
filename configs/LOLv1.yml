@@ -6,7 +6,7 @@ data:
     channels: 3
     dwt_levels: 2
     num_workers: 0
-    data_dir: "/home/mlr/nihal/underwater/image_dirs"
+    data_dir: "/kaggle/input/lsui-large-scale-underwater-image-dataset"
     ckpt_dir: "ckpt/"
     conditional: True
 
@@ -28,7 +28,7 @@ diffusion:
     num_diffusion_timesteps: 200
 
 training:
-    batch_size: 42
+    batch_size: 8
     n_epochs: 500
     validation_freq: 1000
 
@@ -43,6 +43,6 @@ optim:
 
 wandb:
     token: "8285c1e86ba66976957cd9bdbae9e646b37bba8f"
-    name: "diffLL_LSUI"
-    resume: true
-    id: '438gg6ln'
+    name: "Diff_UNet_LSUI_13_07"
+    # resume: true
+    # id: '438gg6ln'

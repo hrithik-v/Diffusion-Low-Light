@@ -11,6 +11,7 @@ from models.wavelet import DWT, IWT
 from pytorch_msssim import ssim
 from models.mods import HFRM
 from models.icdt import ICDT, timestep_embedding
+from models.unet import DiffusionUNet
 import torchvision.models
 import wandb
 from tqdm import tqdm
@@ -129,8 +130,9 @@ class Net(nn.Module):
             [HFRM(in_channels=3, out_channels=64) for _ in range(self.dwt_levels)]
         )
         
-        icdt_img_size = config.data.patch_size // (2 ** self.dwt_levels)
-        self.ICDT = ICDT(latent_dim=3, img_size=icdt_img_size, patch_size=4)
+        # icdt_img_size = config.data.patch_size // (2 ** self.dwt_levels)
+        # self.ICDT = ICDT(latent_dim=3, img_size=icdt_img_size, patch_size=4)
+        self.Unet = DiffusionUNet(config)
 
         betas = get_beta_schedule(
             beta_schedule=config.diffusion.beta_schedule,
@@ -162,8 +164,9 @@ class Net(nn.Module):
             at_next = self.compute_alpha(b, next_t.long())
             xt = xs[-1].to(x.device)
 
-            t_embed = timestep_embedding(t, 256)
-            et = self.ICDT(xt, x_cond, t_embed)
+            # t_embed = timestep_embedding(t, 256)
+            # et = self.ICDT(xt, x_cond, t_embed)
+            et = self.Unet(torch.cat([x_cond, xt], dim=1), t)
 
             x0_t = (xt - et * (1 - at).sqrt()) / at.sqrt()
 
@@ -218,9 +221,9 @@ class Net(nn.Module):
             # ---------Noise addition----------
             x_gt = final_gt_LL * a.sqrt() + e * (1.0 - a).sqrt()
             # ---------Predicted noise----------
-            t_embed = timestep_embedding(t.float(), 256)
-            noise_output = self.ICDT(x_gt, final_LL_input, t_embed)
-
+            # t_embed = timestep_embedding(t.float(), 256)
+            # noise_output = self.ICDT(x_gt, final_LL_input, t_embed)
+            noise_output = self.Unet(torch.cat([final_LL_input, x_gt], dim=1), t.float())
             # ---------Denoising that added noise to get denoised LL Subbands----------
             denoised_LL = self.sample_training(final_LL_input, b)
 
@@ -331,10 +334,10 @@ class DenoisingDiffusion(object):
         self.l2_loss = torch.nn.MSELoss()
         self.l1_loss = torch.nn.L1Loss()
         # Use DataParallel for VGGPerceptualLoss if multiple GPUs are available
-        perceptual = VGGPerceptualLoss().to(self.device)
-        if torch.cuda.device_count() > 1:
-            perceptual = nn.DataParallel(perceptual)
-        self.perceptual_loss = perceptual
+        # perceptual = VGGPerceptualLoss().to(self.device)
+        # if torch.cuda.device_count() > 1:
+        #     perceptual = nn.DataParallel(perceptual)
+        # self.perceptual_loss = perceptual
         self.color_loss = ColorLoss().to(self.device)
         self.TV_loss = TVLoss()
 
@@ -358,11 +361,21 @@ class DenoisingDiffusion(object):
             self.ema_helper.ema(self.model)
         print("=> loaded checkpoint {} step {} epoch {}".format(load_path, self.step, getattr(self, 'start_epoch', 0)))
 
+    class DummyScaler:
+        def scale(self, loss):
+            return loss
+        def step(self, optimizer):
+            optimizer.step()
+        def update(self):
+            pass
+        def unscale_(self, optimizer):
+            pass
+
     def train(self, DATASET):
         # cudnn.benchmark = True
         train_loader, val_loader = DATASET.get_loaders()
 
-        scaler = torch.amp.GradScaler("cuda")
+        scaler = self.DummyScaler()
 
         if os.path.isfile(self.args.resume):
             self.load_ddm_ckpt(self.args.resume)
@@ -383,12 +396,13 @@ class DenoisingDiffusion(object):
 
                 with torch.amp.autocast("cuda"):
                     output = self.model(x) # [B, 2*C, H, W] for training, [B, C, H, W] for inference
-                    noise_loss, photo_loss, frequency_loss, perceptual_loss, color_loss = self.estimation_loss(x, output)
+                    noise_loss, photo_loss, frequency_loss, color_loss = self.estimation_loss(x, output)
+                    # noise_loss, photo_loss, frequency_loss, perceptual_loss, color_loss = self.estimation_loss(x, output)
                     # Balanced loss weighting (no vlb in old commit)
                     noise = noise_loss
                     photo = photo_loss
                     freq = frequency_loss
-                    percep = perceptual_loss
+                    # percep = perceptual_loss
                     color = color_loss
                     if noise is not None and hasattr(noise, 'dim') and noise.dim() > 0:
                         noise = noise.mean()
@@ -396,20 +410,22 @@ class DenoisingDiffusion(object):
                         photo = photo.mean()
                     if freq is not None and hasattr(freq, 'dim') and freq.dim() > 0:
                         freq = freq.mean()
-                    if percep is not None and hasattr(percep, 'numel') and percep.numel() > 1:
-                        percep = percep.mean()
+                    # if percep is not None and hasattr(percep, 'numel') and percep.numel() > 1:
+                    #     percep = percep.mean()
                     if color is not None and hasattr(color, 'dim') and color.dim() > 0:
                         color = color.mean()
                         
                     loss = (
-                        noise + photo + freq +
-                        0.2 * percep + 
-                        0.05 * color
+                        noise 
+                        # + photo + freq +
+                        # 0.2 * percep + 
+                        # 0.05 * color
                     )
                     # Check for NaN values and skip if found
                     if torch.isnan(loss) or torch.isinf(loss):
                         print(f"Warning: NaN or Inf detected in loss at step {self.step}")
-                        print(f"noise: {noise.item()}, photo: {photo.item()}, freq: {freq.item()}, percep: {percep.item()}, color: {color.item()}")
+                        print(f"noise: {noise.item()}, photo: {photo.item()}, freq: {freq.item()}, color: {color.item()}")
+                        # print(f"noise: {noise.item()}, photo: {photo.item()}, freq: {freq.item()}, percep: {percep.item()}, color: {color.item()}")
                         continue
 
                 if self.step % 10 == 0:
@@ -427,7 +443,7 @@ class DenoisingDiffusion(object):
                             'noise_loss': noise_loss.item(),
                             'photo_loss': photo_loss.item(),
                             'frequency_loss': frequency_loss.item(),
-                            'perceptual_loss': percep.item(),
+                            # 'perceptual_loss': percep.item(),
                             'color_loss': color_loss.item(),
                             'lr': self.scheduler.get_last_lr()[0],
                             'epoch': epoch,
@@ -512,12 +528,13 @@ class DenoisingDiffusion(object):
         photo_loss = content_loss + ssim_loss
 
         # =============perceptual loss==================
-        perceptual_loss = self.perceptual_loss(pred_x, gt_img)
+        # perceptual_loss = self.perceptual_loss(pred_x, gt_img)
 
         # =============color loss==================
         color_loss = self.color_loss(pred_x, gt_img)
 
-        return noise_loss, photo_loss, frequency_loss, perceptual_loss, color_loss
+        return noise_loss, photo_loss, frequency_loss, color_loss
+        # return noise_loss, photo_loss, frequency_loss, perceptual_loss, color_loss
 
     def sample_validation_patches(self, val_loader, step):
         self.model.eval()
