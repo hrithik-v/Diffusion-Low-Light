@@ -4,3 +4,4 @@ ckpt
 results
 samples
 *.ini*.patch
+*.db

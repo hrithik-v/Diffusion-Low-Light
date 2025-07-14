@@ -402,7 +402,6 @@ class DenoisingDiffusion(object):
         train_loader, val_loader = DATASET.get_loaders()
         print("===> training on {} samples...".format(len(train_loader.dataset)))
 
-        scaler = self.DummyScaler()
 
         if os.path.isfile(self.args.resume):
             self.load_ddm_ckpt(self.args.resume)
@@ -421,44 +420,28 @@ class DenoisingDiffusion(object):
 
                 x = x.to(self.device)
 
-                with torch.amp.autocast("cuda"):
-                    output = self.model(x) # [B, 2*C, H, W] for training, [B, C, H, W] for inference
-                    # noise_loss, photo_loss, frequency_loss, color_loss = self.estimation_loss(x, output)
-                    noise_loss, photo_loss, frequency_loss, perc_loss, color_loss = self.estimation_loss(x, output)
-                    # Balanced loss weighting (no vlb in old commit)
-                    noise = noise_loss
-                    photo = photo_loss
-                    freq = frequency_loss
-                    percep = perc_loss
-                    color = color_loss
-                    if noise is not None and hasattr(noise, 'dim') and noise.dim() > 0:
-                        print(f"noise.shape before mean: {noise.shape}")
-                        noise = noise.mean()
-                    if photo is not None and hasattr(photo, 'dim') and photo.dim() > 0:
-                        print(f"photo.shape before mean: {photo.shape}")
-                        photo = photo.mean()
-                    if freq is not None and hasattr(freq, 'dim') and freq.dim() > 0:
-                        print(f"freq.shape before mean: {freq.shape}")
-                        freq = freq.mean()
-                    if percep is not None and hasattr(percep, 'numel') and percep.numel() > 1:
-                        print(f"percep.shape before mean: {percep.shape}")
-                        percep = percep.mean()
-                    if color is not None and hasattr(color, 'dim') and color.dim() > 0:
-                        print(f"color.shape before mean: {color.shape}")
-                        color = color.mean()
-                        
-                    loss = (
-                        noise 
-                        + 0.5*photo + 0.1*freq 
-                        + 0.2 * percep 
-                        + 0.2 * color
-                    )
+                output = self.model(x) # [B, 2*C, H, W] for training, [B, C, H, W] for inference
+                # noise_loss, photo_loss, frequency_loss, col_loss = self.estimation_loss(x, output)
+                noise_loss, photo_loss, frequency_loss, perc_loss, col_loss = self.estimation_loss(x, output)
+                # Balanced loss weighting (no vlb in old commit)
+                noise = noise_loss
+                photo = photo_loss
+                freq = frequency_loss
+                percep = perc_loss
+                color = col_loss
+                loss = (
+                    noise 
+                    + 0.5*photo 
+                    + 0.1*freq 
+                    + 0.2 * percep 
+                    + 0.2 * color
+                )
                     # Check for NaN values and skip if found
-                    if torch.isnan(loss) or torch.isinf(loss):
-                        print(f"Warning: NaN or Inf detected in loss at step {self.step}")
-                        print(f"noise: {noise.item()}, photo: {photo.item()}, freq: {freq.item()}, color: {color.item()}")
-                        # print(f"noise: {noise.item()}, photo: {photo.item()}, freq: {freq.item()}, percep: {percep.item()}, color: {color.item()}")
-                        continue
+                if torch.isnan(loss) or torch.isinf(loss):
+                    print(f"Warning: NaN or Inf detected in loss at step {self.step}")
+                    print(f"noise: {noise.item()}, photo: {photo.item()}, freq: {freq.item()}, color: {color.item()}")
+                    # print(f"noise: {noise.item()}, photo: {photo.item()}, freq: {freq.item()}, percep: {percep.item()}, color: {color.item()}")
+                    continue
 
                 if self.step % 10 == 0:
                     # print("step:{}, lr:{:.6f}, loss:{:.4f}, noise:{:.4f}, photo:{:.4f}, "
@@ -467,7 +450,7 @@ class DenoisingDiffusion(object):
                     #                                  noise_loss.item(), photo_loss.item(),
                     #                                  frequency_loss.item(),
                     #                                  percep.item(),
-                    #                                  color_loss.item()))
+                    #                                  col_loss.item()))
                     # wandb logging
                     if wandb.run is not None:
                         wandb.log({
@@ -475,26 +458,26 @@ class DenoisingDiffusion(object):
                             'noise_loss': noise_loss.item(),
                             'photo_loss': photo_loss.item(),
                             'frequency_loss': frequency_loss.item(),
-                            # 'perceptual_loss': percep.item(),
-                            'color_loss': color_loss.item(),
+                            'perceptual_loss': percep.item(),
+                            'col_loss': col_loss.item(),
                             'lr': self.scheduler.get_last_lr()[0],
                             'epoch': epoch,
                             'step': self.step
                         })
 
                 self.optimizer.zero_grad()
-                scaler.scale(loss).backward()
+                loss.backward()
+                self.optimizer.step()
+                self.ema_helper.update(self.model)
+                
+                data_start = time.time()
 
+                
                 # Compute total gradient norm before clipping
                 # scaler.unscale_(self.optimizer)
                 # total_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 # if total_norm > 1.0:
                 #     print(f"Warning: Gradient norm ({total_norm:.4f}) exceeded max_norm before clipping at step {self.step}")
-                
-                scaler.step(self.optimizer)
-                scaler.update()
-                self.ema_helper.update(self.model)
-                data_start = time.time()
 
                 # if self.step % self.config.training.validation_freq == 0 and self.step != 0:
                 #     self.model.eval()
@@ -563,10 +546,10 @@ class DenoisingDiffusion(object):
         perce_loss = perceptual_loss(pred_x, gt_img, self.feature_extractor)
 
         # =============color loss==================
-        color_loss = self.color_loss(pred_x, gt_img)
+        col_loss = self.color_loss(pred_x, gt_img)
 
-        # return noise_loss, photo_loss, frequency_loss, color_loss
-        return noise_loss, photo_loss, frequency_loss, perce_loss, color_loss
+        # return noise_loss, photo_loss, frequency_loss, col_loss
+        return noise_loss, photo_loss, frequency_loss, perce_loss, col_loss
 
     def sample_validation_patches(self, val_loader, step):
         self.model.eval()

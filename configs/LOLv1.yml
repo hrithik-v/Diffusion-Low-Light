@@ -43,6 +43,6 @@ optim:
 
 wandb:
     token: "8285c1e86ba66976957cd9bdbae9e646b37bba8f"
-    name: "UNet_LSUI_14_07_All_Losses"
-    # resume: true
-    # id: 'ta0dvnqw'
+    name: "UNet_14_07_AllLosses_oldDWT"
+    resume: true
+    id: 'onmy5aui'
