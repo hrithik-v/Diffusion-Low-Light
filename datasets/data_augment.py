@@ -1,11 +1,18 @@
 import random
 import torchvision.transforms as transforms
 import torchvision.transforms.functional as F
+from PIL import Image
 
 
 class PairRandomCrop(transforms.RandomCrop):
 
     def __call__(self, image, label):
+        # Automatically resize if smaller than crop size
+        # self.size is (height, width)
+        h, w = self.size if isinstance(self.size, (list, tuple)) else (self.size, self.size)
+        if image.width < w or image.height < h:
+            image = image.resize((max(w, image.width), max(h, image.height)), Image.BICUBIC)
+            label = label.resize((max(w, label.width), max(h, label.height)), Image.BICUBIC)
 
         if self.padding is not None:
             image = F.pad(image, self.padding, self.fill, self.padding_mode)

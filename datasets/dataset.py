@@ -47,9 +47,9 @@ class AllWeatherDataset(torch.utils.data.Dataset):
                 PairToTensor()
             ])
         else:
-            # Resize validation images to patch_size instead of cropping
+            # Resize validation images to patch_size instead of cropping (use bicubic for smoothness)
             self.transforms = PairCompose([
-                # PairResize((self.patch_size, self.patch_size)),
+                PairResize((self.patch_size, self.patch_size), interpolation=Image.BICUBIC),
                 PairToTensor()
             ])
 
@@ -60,12 +60,12 @@ class AllWeatherDataset(torch.utils.data.Dataset):
         input_img = Image.open(os.path.join(self.raw_dir, input_name)).convert('RGB')
         gt_img = Image.open(os.path.join(self.ref_dir, gt_name)).convert('RGB')
 
-        # Automatically resize images if smaller than patch size
-        min_size = self.patch_size
-        if input_img.width < min_size or input_img.height < min_size:
-            input_img = input_img.resize((max(min_size, input_img.width), max(min_size, input_img.height)), Image.BICUBIC)
-        if gt_img.width < min_size or gt_img.height < min_size:
-            gt_img = gt_img.resize((max(min_size, gt_img.width), max(min_size, gt_img.height)), Image.BICUBIC)
+        # # Automatically resize images if smaller than patch size
+        # min_size = self.patch_size
+        # if input_img.width < min_size or input_img.height < min_size:
+        #     input_img = input_img.resize((max(min_size, input_img.width), max(min_size, input_img.height)), Image.BICUBIC)
+        # if gt_img.width < min_size or gt_img.height < min_size:
+        #     gt_img = gt_img.resize((max(min_size, gt_img.width), max(min_size, gt_img.height)), Image.BICUBIC)
 
         input_img, gt_img = self.transforms(input_img, gt_img)
 

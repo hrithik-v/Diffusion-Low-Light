@@ -10,6 +10,8 @@ import utils
 from models.wavelet import DWT, IWT
 from pytorch_msssim import ssim
 from models.mods import HFRM
+from torchvision.models import vgg16
+import cv2
 from models.icdt import ICDT, timestep_embedding
 from models.unet import DiffusionUNet
 import torchvision.models
@@ -23,6 +25,12 @@ def data_transform(X):
 def inverse_data_transform(X):
     return torch.clamp((X + 1.0) / 2.0, 0.0, 1.0)
 
+# ==================
+def perceptual_loss(pred, gt, feature_extractor):
+    pred_features = feature_extractor(pred)
+    gt_features = feature_extractor(gt)
+    return F.l1_loss(pred_features, gt_features)
+# ==================
 
 class TVLoss(nn.Module):
     def __init__(self, TVLoss_weight=1):
@@ -257,6 +265,7 @@ class Net(nn.Module):
         return data_dict
 
 
+
 class VGGPerceptualLoss(nn.Module):
     def __init__(self, resize=True):
         super(VGGPerceptualLoss, self).__init__()
@@ -301,18 +310,6 @@ class VGGPerceptualLoss(nn.Module):
         return loss
 
 
-class ColorLoss(nn.Module):
-    def __init__(self):
-        super(ColorLoss, self).__init__()
-
-    def forward(self, x1, x2):
-        mean_rgb1 = torch.mean(x1, [2, 3], keepdim=True)
-        mean_rgb2 = torch.mean(x2, [2, 3], keepdim=True)
-
-        d_rgb1 = torch.pow(mean_rgb1 - torch.mean(mean_rgb1, 1, keepdim=True), 2)
-        d_rgb2 = torch.pow(mean_rgb2 - torch.mean(mean_rgb2, 1, keepdim=True), 2)
-
-        return torch.sqrt(torch.pow(d_rgb1 - d_rgb2, 2).sum(1) + 1e-6).mean()
 
 
 class DenoisingDiffusion(object):
@@ -338,11 +335,40 @@ class DenoisingDiffusion(object):
         # if torch.cuda.device_count() > 1:
         #     perceptual = nn.DataParallel(perceptual)
         # self.perceptual_loss = perceptual
-        self.color_loss = ColorLoss().to(self.device)
+        # self.color_loss = ColorLoss().to(self.device)
         self.TV_loss = TVLoss()
+            
+        self.feature_extractor = vgg16(pretrained=True).features.eval()
+        self.feature_extractor.to(self.device)
+
 
         self.optimizer, self.scheduler = utils.optimize.get_optimizer(self.config, self.model.parameters())
         self.start_epoch, self.step = 0, 0
+
+    def color_loss(self, pred, gt):
+        """
+        Color restoration loss using LAB color space.
+        Assumes input tensors are normalized to [0,1].
+        """
+        pred_lab = self.rgb_to_lab(pred)
+        gt_lab = self.rgb_to_lab(gt)
+        
+        l_loss = F.l1_loss(pred_lab[:, 0, :, :], gt_lab[:, 0, :, :])  # Luminance channel
+        ab_loss = F.l1_loss(pred_lab[:, 1:, :, :], gt_lab[:, 1:, :, :])  # Chromaticity channels
+        
+        return l_loss + ab_loss
+
+    def rgb_to_lab(self, img):
+        """
+        Convert normalized RGB tensors to LAB color space.
+        """
+        img_np = img.permute(0, 2, 3, 1).detach().cpu().numpy()  # Convert to [B, H, W, C]
+        img_np = (img_np * 255).astype(np.uint8)
+        lab_img = [cv2.cvtColor(img_np[i], cv2.COLOR_RGB2LAB) for i in range(img_np.shape[0])]
+        lab_img = np.stack(lab_img, axis=0)
+        lab_img = torch.from_numpy(lab_img).permute(0, 3, 1, 2).float().to(img.device)  # Convert to float tensor
+        return lab_img
+
 
     def load_ddm_ckpt(self, load_path, ema=False):
         checkpoint = utils.logging.load_checkpoint(load_path, None)
@@ -374,6 +400,7 @@ class DenoisingDiffusion(object):
     def train(self, DATASET):
         # cudnn.benchmark = True
         train_loader, val_loader = DATASET.get_loaders()
+        print("===> training on {} samples...".format(len(train_loader.dataset)))
 
         scaler = self.DummyScaler()
 
@@ -396,30 +423,35 @@ class DenoisingDiffusion(object):
 
                 with torch.amp.autocast("cuda"):
                     output = self.model(x) # [B, 2*C, H, W] for training, [B, C, H, W] for inference
-                    noise_loss, photo_loss, frequency_loss, color_loss = self.estimation_loss(x, output)
-                    # noise_loss, photo_loss, frequency_loss, perceptual_loss, color_loss = self.estimation_loss(x, output)
+                    # noise_loss, photo_loss, frequency_loss, color_loss = self.estimation_loss(x, output)
+                    noise_loss, photo_loss, frequency_loss, perc_loss, color_loss = self.estimation_loss(x, output)
                     # Balanced loss weighting (no vlb in old commit)
                     noise = noise_loss
                     photo = photo_loss
                     freq = frequency_loss
-                    # percep = perceptual_loss
+                    percep = perc_loss
                     color = color_loss
                     if noise is not None and hasattr(noise, 'dim') and noise.dim() > 0:
+                        print(f"noise.shape before mean: {noise.shape}")
                         noise = noise.mean()
                     if photo is not None and hasattr(photo, 'dim') and photo.dim() > 0:
+                        print(f"photo.shape before mean: {photo.shape}")
                         photo = photo.mean()
                     if freq is not None and hasattr(freq, 'dim') and freq.dim() > 0:
+                        print(f"freq.shape before mean: {freq.shape}")
                         freq = freq.mean()
-                    # if percep is not None and hasattr(percep, 'numel') and percep.numel() > 1:
-                    #     percep = percep.mean()
+                    if percep is not None and hasattr(percep, 'numel') and percep.numel() > 1:
+                        print(f"percep.shape before mean: {percep.shape}")
+                        percep = percep.mean()
                     if color is not None and hasattr(color, 'dim') and color.dim() > 0:
+                        print(f"color.shape before mean: {color.shape}")
                         color = color.mean()
                         
                     loss = (
                         noise 
-                        # + photo + freq +
-                        # 0.2 * percep + 
-                        # 0.05 * color
+                        + 0.5*photo + 0.1*freq 
+                        + 0.2 * percep 
+                        + 0.2 * color
                     )
                     # Check for NaN values and skip if found
                     if torch.isnan(loss) or torch.isinf(loss):
@@ -528,13 +560,13 @@ class DenoisingDiffusion(object):
         photo_loss = content_loss + ssim_loss
 
         # =============perceptual loss==================
-        # perceptual_loss = self.perceptual_loss(pred_x, gt_img)
+        perce_loss = perceptual_loss(pred_x, gt_img, self.feature_extractor)
 
         # =============color loss==================
         color_loss = self.color_loss(pred_x, gt_img)
 
-        return noise_loss, photo_loss, frequency_loss, color_loss
-        # return noise_loss, photo_loss, frequency_loss, perceptual_loss, color_loss
+        # return noise_loss, photo_loss, frequency_loss, color_loss
+        return noise_loss, photo_loss, frequency_loss, perce_loss, color_loss
 
     def sample_validation_patches(self, val_loader, step):
         self.model.eval()

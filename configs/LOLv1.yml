@@ -7,7 +7,7 @@ data:
     dwt_levels: 2
     num_workers: 0
     data_dir: "/kaggle/input/lsui-large-scale-underwater-image-dataset"
-    ckpt_dir: "ckpt/"
+    ckpt_dir: "ckpt/UNet_LSUI_14_07_All_Losses"
     conditional: True
 
 model:
@@ -28,7 +28,7 @@ diffusion:
     num_diffusion_timesteps: 200
 
 training:
-    batch_size: 8
+    batch_size: 16
     n_epochs: 500
     validation_freq: 1000
 
@@ -43,6 +43,6 @@ optim:
 
 wandb:
     token: "8285c1e86ba66976957cd9bdbae9e646b37bba8f"
-    name: "Diff_UNet_LSUI_13_07"
+    name: "UNet_LSUI_14_07_All_Losses"
     # resume: true
-    # id: '438gg6ln'
+    # id: 'ta0dvnqw'

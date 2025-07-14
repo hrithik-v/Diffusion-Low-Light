@@ -60,10 +60,10 @@ def save_grid(org_imgs, gt_imgs, gen_imgs, n, out_path, ckpt_step):
 def main():
     parser = argparse.ArgumentParser(description="Inference and visualization for DenoisingDiffusion")
     parser.add_argument("--config", type=str, default="configs/LOLv1.yml", help="Path to config YAML file")
-    parser.add_argument("--run_name", type=str, default="2nd_run", help="Name of the run (used for ckpt and output dir)")
-    parser.add_argument("--ckpt_step", type=str, default="180", help="Checkpoint step (used for ckpt filename)")
+    parser.add_argument("--run_name", type=str, default="Diff_UNet_LSUI_13_07", help="Name of the run (used for ckpt and output dir)")
+    parser.add_argument("--ckpt_step", type=str, default="latest", help="Checkpoint step (used for ckpt filename)")
     parser.add_argument("--num_samples", type=int, default=8, help="Number of samples to visualize")
-    parser.add_argument("--sampling_timesteps", type=int, default=40)
+    parser.add_argument("--sampling_timesteps", type=int, default=10)
     parser.add_argument("--seed", type=int, default=None, help="Manual seed for reproducibility (default: None, uses system time)")
     args = parser.parse_args()
 
@@ -107,6 +107,7 @@ def main():
     for idx in sample_indices:
         x, y = val_dataset[idx]
         x = x.unsqueeze(0).to(device)
+        print("x shape:", x.shape)
         with torch.no_grad():
             out = diffusion.model(x)
             pred_x = out["pred_x"].cpu().numpy()[0]
