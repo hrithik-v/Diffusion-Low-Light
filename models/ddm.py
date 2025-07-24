@@ -151,11 +151,11 @@ class Net(nn.Module):
         self.num_timesteps = self.betas.shape[0]
 
         # Freeze all parameters except HFRM modules
-        # for name, param in self.named_parameters():
-        #     if ("high_enhance0" in name) or ("high_enhance1" in name):
-        #         param.requires_grad = True
-        #     else:
-        #         param.requires_grad = False
+        for name, param in self.named_parameters():
+            if ("high_enhance0" in name) or ("high_enhance1" in name):
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
 
     @staticmethod
     def compute_alpha(beta, t):
@@ -409,8 +409,25 @@ class DenoisingDiffusion(object):
                         # artifact = wandb.Artifact('model-checkpoint', type='model')
                         # artifact.add_file(ckpt_path)
                         # wandb.log_artifact(artifact)
-                                                    
-                self.scheduler.step()
+                                        
+                # self.scheduler.step()
+            # saving ckpt after every 25 epochs
+            if (epoch + 1) % 25 == 0:
+                ckpt_filename = f'model_epoch_{epoch + 1}.pth.tar'
+                ckpt_path = os.path.join(self.config.data.ckpt_dir, ckpt_filename)
+                print(f"Saving checkpoint to: {ckpt_path}")
+                
+                # Save the checkpoint
+                utils.logging.save_checkpoint({
+                    'step': self.step,
+                    'epoch': epoch + 1,
+                    'state_dict': self.model.state_dict(),
+                    'optimizer': self.optimizer.state_dict(),
+                    'scheduler': self.scheduler.state_dict(),
+                    'ema_helper': self.ema_helper.state_dict(),
+                    'params': self.args,
+                    'config': self.config
+                }, filename=os.path.join(self.config.data.ckpt_dir, f'model_epoch_{epoch + 1}'))
 
     def estimation_loss(self, x, output):
         # Original outputs from the model
@@ -451,9 +468,9 @@ class DenoisingDiffusion(object):
 
         frequency_loss = (
             1.0 * l2_HF +          # ↑ from 0.1 to 1.0
-            0.1 * tv_HF +          # ↑ from 0.01 to 0.1
-            0.2 * l2_LL +          # optional — keep this weaker
-            0.01 * tv_LL           # optional — very light TV on LL
+            0.1 * tv_HF           # ↑ from 0.01 to 0.1
+            # 0.2 * l2_LL +          # optional — keep this weaker
+            # 0.01 * tv_LL           # optional — very light TV on LL
         )
         frequency_loss += 0.2 * L_edge
 
@@ -472,11 +489,11 @@ class DenoisingDiffusion(object):
 
         # Combine losses
         total_loss = (
-            noise_loss +
-            0.5 * frequency_loss +
-            0.5 * photo_loss +
-            0.2 * color_loss_val +
-            0.2 * perceptual_loss_val
+            0.0 * noise_loss +
+            2.0 * frequency_loss +
+            0.1 * photo_loss +
+            0.1 * color_loss_val +
+            0.1 * perceptual_loss_val
         )
 
         return total_loss, noise_loss, photo_loss, frequency_loss, color_loss_val, perceptual_loss_val

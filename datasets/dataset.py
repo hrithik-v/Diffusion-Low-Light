@@ -63,21 +63,20 @@ class AllWeatherDataset(torch.utils.data.Dataset):
         self.patch_size = patch_size
 
         if self.train:
-            self.raw_dir = os.path.join(root_dir, 'train', 'raw')
-            self.ref_dir = os.path.join(root_dir, 'train', 'ref')
+            self.raw_dir = os.path.join(root_dir, 'input')
+            # self.raw_dir = os.path.join(root_dir, 'train', 'raw')
+            self.ref_dir = os.path.join(root_dir, 'GT')
+            # self.ref_dir = os.path.join(root_dir, 'train', 'ref')
         else:
             # For validation or test phase
-            self.raw_dir = os.path.join(root_dir, 'val', 'raw')
-            self.ref_dir = os.path.join(root_dir, 'val', 'ref')
+            self.raw_dir = os.path.join(root_dir, 'input')
+            self.ref_dir = os.path.join(root_dir, 'GT')
 
         # Get list of raw images
-        self.input_names = sorted(glob.glob(os.path.join(self.raw_dir, '*.png')))
+        self.input_names = sorted([f for f in os.listdir(self.raw_dir) if os.path.isfile(os.path.join(self.raw_dir, f))])
         print("Found raw images:", len(self.input_names), "in", self.raw_dir)
 
-        # For each raw image, assume ref image with the same name exists in ref_dir
-        # We'll match them by filename
-        self.gt_names = [os.path.join(self.ref_dir, os.path.basename(x)) for x in self.input_names]
-
+        self.gt_names = self.input_names  # Assume same filenames in ref_dir
         print("Found ref images:", len(self.gt_names), "in", self.ref_dir)
 
         if self.train:
@@ -94,11 +93,10 @@ class AllWeatherDataset(torch.utils.data.Dataset):
             ])
 
     def __getitem__(self, index):
-        input_path = self.input_names[index]
-        gt_path = self.gt_names[index]
+        input_path = os.path.join(self.raw_dir, self.input_names[index])
+        gt_path = os.path.join(self.ref_dir, self.gt_names[index])
         # print(f" number of images in input path and gt path: {len(input_path)}, {len(gt_path)}")   
         input_img = Image.open(input_path).convert('RGB')
-
         gt_img = Image.open(gt_path).convert('RGB')
         # print(f"input_img: {input_img.size}, gt_img: {gt_img.size}")
         # print(f"length of input_img: {len(input_img.size)}, length of gt_img: {len(gt_img.size)}")

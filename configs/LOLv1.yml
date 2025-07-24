@@ -6,8 +6,9 @@ data:
     channels: 3
     dwt_levels: 2
     num_workers: 4
-    data_dir: "/home/mlr/nihal/underwater/image_dirs"
-    ckpt_dir: "ckpt/continued_Transf"
+    data_dir: "/kaggle/input/lsui-large-scale-underwater-image-dataset"
+    # data_dir: "/home/mlr/nihal/underwater/image_dirs"
+    ckpt_dir: "ckpt/improved_HFRM"
     conditional: True
 
 model:
@@ -43,6 +44,6 @@ optim:
 
 wandb:
     token: "8285c1e86ba66976957cd9bdbae9e646b37bba8f"
-    name: "continued_Transf"
-    resume: true
-    id: "lfcgu453"
+    name: "improved_HFRM"
+    # resume: true
+    # id: "lfcgu453"
