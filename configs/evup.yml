@@ -1,13 +1,13 @@
 data:
     type: "LLdataset"
-    train_dataset: "LSUI"
-    val_dataset: "LSUI"
+    train_dataset: "EVUP"
+    val_dataset: "EVUP"
     patch_size: 256
     channels: 3
-    dwt_levels: 2
-    num_workers: 4
-    data_dir: "/home/mlr/nihal/underwater/image_dirs"
-    ckpt_dir: "ckpt/continued_Transf"
+    num_workers: 16
+    data_dir:  "/media/anil/New Volume5/research/vidhi/dll/dll/data"
+
+    ckpt_dir: "ckpts/"
     conditional: True
 
 model:
@@ -15,34 +15,30 @@ model:
     out_ch: 3
     ch: 64
     ch_mult: [1, 2, 3, 4]
-    num_res_blocks: 2
+    num_res_blocks: 3
     dropout: 0.0
     ema_rate: 0.999
     ema: True
     resamp_with_conv: True
 
 diffusion:
-    beta_schedule: linear
+    beta_schedule: sigmoid
     beta_start: 0.0001
     beta_end: 0.02
     num_diffusion_timesteps: 200
 
 training:
-    batch_size: 24
-    n_epochs: 700
-    validation_freq: 1000
+    batch_size: 16
+    n_epochs: 500
+    validation_freq: 232
 
 optim:
     weight_decay: 0.000
     optimizer: "Adam"
-    lr: 0.00001
+    lr: 0.0001
     amsgrad: False
     eps: 0.00000001
     step_size: 50
     gamma: 0.8
 
-wandb:
-    token: "8285c1e86ba66976957cd9bdbae9e646b37bba8f"
-    name: "continued_Transf"
-    resume: true
-    id: "lfcgu453"
+

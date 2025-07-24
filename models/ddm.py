@@ -1,22 +1,30 @@
+import os 
+import sys
+
+sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
+
 import os
 import time
-import math
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 import utils
+from models.unet import DiffusionUNet
+from models.icdt import ICDT, timestep_embedding
 from models.wavelet import DWT, IWT
 from pytorch_msssim import ssim
 from models.mods import HFRM
 from torchvision.models import vgg16
 import cv2
-from models.icdt import ICDT, timestep_embedding
-from models.unet import DiffusionUNet
-import torchvision.models
+
 import wandb
+from utils import metrics
+# from torchinfo import summary
 from tqdm import tqdm
+import torch
+
 
 def data_transform(X):
     return 2 * X - 1.0
@@ -24,13 +32,12 @@ def data_transform(X):
 
 def inverse_data_transform(X):
     return torch.clamp((X + 1.0) / 2.0, 0.0, 1.0)
-
-# ==================
 def perceptual_loss(pred, gt, feature_extractor):
     pred_features = feature_extractor(pred)
     gt_features = feature_extractor(gt)
     return F.l1_loss(pred_features, gt_features)
-# ==================
+
+
 
 class TVLoss(nn.Module):
     def __init__(self, TVLoss_weight=1):
@@ -61,7 +68,7 @@ class EMAHelper(object):
             module = module.module
         for name, param in module.named_parameters():
             if param.requires_grad:
-                self.shadow[name] = param.data.clone().to(param.device)
+                self.shadow[name] = param.data.clone()
 
     def update(self, module):
         if isinstance(module, nn.DataParallel):
@@ -92,15 +99,7 @@ class EMAHelper(object):
     def state_dict(self):
         return self.shadow
 
-    def load_state_dict(self, state_dict, model):
-        if isinstance(model, nn.DataParallel):
-            model = model.module
-        
-        # Move shadow params to the same device as model params
-        for name, param in model.named_parameters():
-            if name in state_dict:
-                state_dict[name] = state_dict[name].to(param.device)
-
+    def load_state_dict(self, state_dict):
         self.shadow = state_dict
 
 
@@ -132,15 +131,14 @@ class Net(nn.Module):
         self.args = args
         self.config = config
         self.device = config.device
-        self.dwt_levels = config.data.dwt_levels
 
-        self.high_enhancers = nn.ModuleList(
-            [HFRM(in_channels=3, out_channels=64) for _ in range(self.dwt_levels)]
-        )
+
+        self.high_enhance0 = HFRM(in_channels=3, out_channels=64)
+        self.high_enhance1 = HFRM(in_channels=3, out_channels=64)
         
-        # icdt_img_size = config.data.patch_size // (2 ** self.dwt_levels)
-        # self.ICDT = ICDT(latent_dim=3, img_size=icdt_img_size, patch_size=4)
-        self.Unet = DiffusionUNet(config)
+        icdt_img_size = config.data.patch_size // (2 ** config.data.dwt_levels)
+        self.ICDT = ICDT(latent_dim=3, img_size=icdt_img_size, patch_size=4)
+        # self.Unet = DiffusionUNet(config)
 
         betas = get_beta_schedule(
             beta_schedule=config.diffusion.beta_schedule,
@@ -151,6 +149,13 @@ class Net(nn.Module):
 
         self.betas = torch.from_numpy(betas).float()
         self.num_timesteps = self.betas.shape[0]
+
+        # Freeze all parameters except HFRM modules
+        # for name, param in self.named_parameters():
+        #     if ("high_enhance0" in name) or ("high_enhance1" in name):
+        #         param.requires_grad = True
+        #     else:
+        #         param.requires_grad = False
 
     @staticmethod
     def compute_alpha(beta, t):
@@ -172,13 +177,11 @@ class Net(nn.Module):
             at_next = self.compute_alpha(b, next_t.long())
             xt = xs[-1].to(x.device)
 
-            # t_embed = timestep_embedding(t, 256)
-            # et = self.ICDT(xt, x_cond, t_embed)
-            et = self.Unet(torch.cat([x_cond, xt], dim=1), t)
-
+            # et = self.Unet(torch.cat([x_cond, xt], dim=1), t)
+            t_embed = timestep_embedding(t, 256)
+            et = self.ICDT(xt, x_cond, t_embed)
             x0_t = (xt - et * (1 - at).sqrt()) / at.sqrt()
 
-            # DDIM sampling with fixed variance
             c1 = eta * ((1 - at / at_next) * (1 - at_next) / (1 - at)).sqrt()
             c2 = ((1 - at_next) - c1 ** 2).sqrt()
             xt_next = at_next.sqrt() * x0_t + c1 * torch.randn_like(x) + c2 * et
@@ -193,123 +196,62 @@ class Net(nn.Module):
         input_img = x[:, :3, :, :]
         n, c, h, w = input_img.shape
         input_img_norm = data_transform(input_img)
+        input_dwt = dwt(input_img_norm)
 
-        # DWT Decomposition
-        input_LL = input_img_norm
-        input_highs = []
-        for i in range(self.dwt_levels):
-            input_dwt = dwt(input_LL)
-            input_LL, input_high = input_dwt[:n, ...], input_dwt[n:, ...]
-            input_high = self.high_enhancers[i](input_high)
-            input_highs.append(input_high)
+        input_LL, input_high0 = input_dwt[:n, ...], input_dwt[n:, ...]
 
-        final_LL_input = input_LL
+        input_high0 = self.high_enhance0(input_high0)
+
+        input_LL_dwt = dwt(input_LL)
+        input_LL_LL, input_high1 = input_LL_dwt[:n, ...], input_LL_dwt[n:, ...]
+        input_high1 = self.high_enhance1(input_high1)
 
         b = self.betas.to(input_img.device)
 
-        t = torch.randint(low=0, high=self.num_timesteps, size=(final_LL_input.shape[0] // 2 + 1,)).to(self.device)
-        t = torch.cat([t, self.num_timesteps - t - 1], dim=0)[:final_LL_input.shape[0]].to(x.device)
+        t = torch.randint(low=0, high=self.num_timesteps, size=(input_LL_LL.shape[0] // 2 + 1,)).to(self.device)
+        t = torch.cat([t, self.num_timesteps - t - 1], dim=0)[:input_LL_LL.shape[0]].to(x.device)
         a = (1 - b).cumprod(dim=0).index_select(0, t).view(-1, 1, 1, 1)
 
-        e = torch.randn_like(final_LL_input)
+        e = torch.randn_like(input_LL_LL)
 
         if self.training:
             gt_img_norm = data_transform(x[:, 3:, :, :])
-            
-            # GT DWT Decomposition
-            gt_LL = gt_img_norm
-            gt_highs = []
-            for i in range(self.dwt_levels):
-                gt_dwt = dwt(gt_LL)
-                gt_LL, gt_high = gt_dwt[:n, ...], gt_dwt[n:, ...]
-                gt_highs.append(gt_high)
-            
-            final_gt_LL = gt_LL
+            gt_dwt = dwt(gt_img_norm)
+            gt_LL, gt_high0 = gt_dwt[:n, ...], gt_dwt[n:, ...]
 
-            # ---------Noise addition----------
-            x_gt = final_gt_LL * a.sqrt() + e * (1.0 - a).sqrt()
-            # ---------Predicted noise----------
-            # t_embed = timestep_embedding(t.float(), 256)
-            # noise_output = self.ICDT(x_gt, final_LL_input, t_embed)
-            noise_output = self.Unet(torch.cat([final_LL_input, x_gt], dim=1), t.float())
-            # ---------Denoising that added noise to get denoised LL Subbands----------
-            denoised_LL = self.sample_training(final_LL_input, b)
+            gt_LL_dwt = dwt(gt_LL)
+            gt_LL_LL, gt_high1 = gt_LL_dwt[:n, ...], gt_LL_dwt[n:, ...]
 
-            # Inverse DWT Reconstruction
-            pred_LL = denoised_LL
-            for i in range(self.dwt_levels - 1, -1, -1):
-                pred_LL = idwt(torch.cat((pred_LL, input_highs[i]), dim=0))
-            
-            pred_x = inverse_data_transform(pred_LL)
+            x_gt = gt_LL_LL * a.sqrt() + e * (1.0 - a).sqrt()
+            # noise_output = self.Unet(torch.cat([input_LL_LL, x_gt], dim=1), t.float())
+            t_embed = timestep_embedding(t.float(), 256)
+            noise_output = self.ICDT(x_gt, input_LL_LL, t_embed)
+            denoise_LL_LL = self.sample_training(input_LL_LL, b)
 
-            data_dict["input_highs"] = input_highs
-            data_dict["gt_highs"] = gt_highs
-            data_dict["final_gt_LL"] = final_gt_LL
+            pred_LL = idwt(torch.cat((denoise_LL_LL, input_high1), dim=0))
+
+            pred_x = idwt(torch.cat((pred_LL, input_high0), dim=0))
+            pred_x = inverse_data_transform(pred_x)
+
+            data_dict["input_high0"] = input_high0
+            data_dict["input_high1"] = input_high1
+            data_dict["gt_high0"] = gt_high0
+            data_dict["gt_high1"] = gt_high1
+            data_dict["pred_LL"] = pred_LL
+            data_dict["gt_LL"] = gt_LL
             data_dict["noise_output"] = noise_output
             data_dict["pred_x"] = pred_x
             data_dict["e"] = e
-            data_dict["denoised_LL"] = denoised_LL
 
         else:
-            denoised_LL = self.sample_training(final_LL_input, b)
-            
-            # Inverse DWT Reconstruction
-            pred_LL = denoised_LL
-            for i in range(self.dwt_levels - 1, -1, -1):
-                pred_LL = idwt(torch.cat((pred_LL, input_highs[i]), dim=0))
-
-            pred_x = inverse_data_transform(pred_LL)
+            denoise_LL_LL = self.sample_training(input_LL_LL, b)
+            pred_LL = idwt(torch.cat((denoise_LL_LL, input_high1), dim=0))
+            pred_x = idwt(torch.cat((pred_LL, input_high0), dim=0))
+            pred_x = inverse_data_transform(pred_x)
 
             data_dict["pred_x"] = pred_x
 
         return data_dict
-
-
-
-class VGGPerceptualLoss(nn.Module):
-    def __init__(self, resize=True):
-        super(VGGPerceptualLoss, self).__init__()
-        blocks = []
-        blocks.append(torchvision.models.vgg19(pretrained=True).features[:4].eval())
-        blocks.append(torchvision.models.vgg19(pretrained=True).features[4:9].eval())
-        blocks.append(torchvision.models.vgg19(pretrained=True).features[9:18].eval())
-        blocks.append(torchvision.models.vgg19(pretrained=True).features[18:27].eval())
-        blocks.append(torchvision.models.vgg19(pretrained=True).features[27:36].eval())
-        for bl in blocks:
-            for p in bl.parameters():
-                p.requires_grad = False
-        self.blocks = torch.nn.ModuleList(blocks)
-        self.transform = torch.nn.functional.interpolate
-        self.resize = resize
-        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
-        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
-
-    def forward(self, input, target, feature_layers=[0, 1, 2, 3], style_layers=[]):
-        if input.shape[1] != 3:
-            input = input.repeat(1, 3, 1, 1)
-            target = target.repeat(1, 3, 1, 1)
-        input = (input-self.mean) / self.std
-        target = (target-self.mean) / self.std
-        if self.resize:
-            input = self.transform(input, mode='bilinear', size=(224, 224), align_corners=False)
-            target = self.transform(target, mode='bilinear', size=(224, 224), align_corners=False)
-        loss = 0.0
-        x = input
-        y = target
-        for i, block in enumerate(self.blocks):
-            x = block(x)
-            y = block(y)
-            if i in feature_layers:
-                loss += torch.nn.functional.l1_loss(x, y)
-            if i in style_layers:
-                act_x = x.reshape(x.shape[0], x.shape[1], -1)
-                act_y = y.reshape(y.shape[0], y.shape[1], -1)
-                gram_x = act_x @ act_x.permute(0, 2, 1)
-                gram_y = act_y @ act_y.permute(0, 2, 1)
-                loss += torch.nn.functional.l1_loss(gram_x, gram_y)
-        return loss
-
-
 
 
 class DenoisingDiffusion(object):
@@ -319,32 +261,43 @@ class DenoisingDiffusion(object):
         self.config = config
         self.device = config.device
 
-        # Initialize model and move to device
-        self.model = Net(args, config).to(self.device)
-        # Use DataParallel only if multiple GPUs are available
-        if torch.cuda.device_count() > 1:
-            self.model = nn.DataParallel(self.model)
-
+        self.model = Net(args, config)
+        # print(self.model)
+        self.model.to(self.device)
+        self.model = torch.nn.DataParallel(self.model)
+        # summary(self.model, input_size=(1, 6, 256, 256))
         self.ema_helper = EMAHelper()
         self.ema_helper.register(self.model)
 
         self.l2_loss = torch.nn.MSELoss()
         self.l1_loss = torch.nn.L1Loss()
-        # Use DataParallel for VGGPerceptualLoss if multiple GPUs are available
-        # perceptual = VGGPerceptualLoss().to(self.device)
-        # if torch.cuda.device_count() > 1:
-        #     perceptual = nn.DataParallel(perceptual)
-        # self.perceptual_loss = perceptual
-        # self.color_loss = ColorLoss().to(self.device)
         self.TV_loss = TVLoss()
-            
+    
         self.feature_extractor = vgg16(pretrained=True).features.eval()
         self.feature_extractor.to(self.device)
-
+        # Only optimize parameters that require grad (should be HFRM modules)
+        # self.optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, self.model.parameters()), lr=1e-4)
+        # self.scheduler = None  # No scheduler by default
 
         self.optimizer, self.scheduler = utils.optimize.get_optimizer(self.config, self.model.parameters())
+      
         self.start_epoch, self.step = 0, 0
 
+    def sobel_filter(self, x):
+        # x: (N, C, H, W), expects float tensor
+        sobel_x = torch.tensor([[1, 0, -1], [2, 0, -2], [1, 0, -1]], dtype=x.dtype, device=x.device).view(1, 1, 3, 3)
+        sobel_y = torch.tensor([[1, 2, 1], [0, 0, 0], [-1, -2, -1]], dtype=x.dtype, device=x.device).view(1, 1, 3, 3)
+        # Apply per channel
+        edge_x = torch.nn.functional.conv2d(x, sobel_x.repeat(x.shape[1],1,1,1), padding=1, groups=x.shape[1])
+        edge_y = torch.nn.functional.conv2d(x, sobel_y.repeat(x.shape[1],1,1,1), padding=1, groups=x.shape[1])
+        edge = torch.sqrt(edge_x ** 2 + edge_y ** 2 + 1e-6)
+        return edge
+
+    def edge_loss(self, pred, gt):
+        pred_edges = self.sobel_filter(pred)
+        gt_edges = self.sobel_filter(gt)
+        return F.l1_loss(pred_edges, gt_edges)
+    
     def color_loss(self, pred, gt):
         """
         Color restoration loss using LAB color space.
@@ -368,206 +321,264 @@ class DenoisingDiffusion(object):
         lab_img = np.stack(lab_img, axis=0)
         lab_img = torch.from_numpy(lab_img).permute(0, 3, 1, 2).float().to(img.device)  # Convert to float tensor
         return lab_img
-
-
     def load_ddm_ckpt(self, load_path, ema=False):
         checkpoint = utils.logging.load_checkpoint(load_path, None)
         self.model.load_state_dict(checkpoint['state_dict'], strict=True)
-        self.ema_helper.load_state_dict(checkpoint['ema_helper'], self.model)
-        self.optimizer.load_state_dict(checkpoint['optimizer'])
-        self.scheduler.load_state_dict(checkpoint['scheduler'])
-        # Restore epoch and step if present in checkpoint
+        self.ema_helper.load_state_dict(checkpoint['ema_helper'])
+        # Load epoch state if present
         if 'epoch' in checkpoint:
             self.start_epoch = checkpoint['epoch']
-        if 'step' in checkpoint:
-            self.step = checkpoint['step']
-        # if 'optimizer' in checkpoint:
-        # if 'scheduler' in checkpoint:
         if ema:
             self.ema_helper.ema(self.model)
         print("=> loaded checkpoint {} step {} epoch {}".format(load_path, self.step, getattr(self, 'start_epoch', 0)))
 
-    class DummyScaler:
-        def scale(self, loss):
-            return loss
-        def step(self, optimizer):
-            optimizer.step()
-        def update(self):
-            pass
-        def unscale_(self, optimizer):
-            pass
-
     def train(self, DATASET):
         # cudnn.benchmark = True
         train_loader, val_loader = DATASET.get_loaders()
-        print("===> training on {} samples...".format(len(train_loader.dataset)))
-
 
         if os.path.isfile(self.args.resume):
             self.load_ddm_ckpt(self.args.resume)
 
         for epoch in range(self.start_epoch, self.config.training.n_epochs):
-            # print('epoch: ', epoch)
+            tqdm.write(f"Epoch: {epoch + 1}/{self.config.training.n_epochs}")
             data_start = time.time()
             data_time = 0
-            for i, (x, y) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{self.config.training.n_epochs}")):
-                # print(f"x.shape: {x.shape}, y: {y}")
-                x = x.flatten(start_dim=0, end_dim=1) if x.ndim == 5 else x
-                # print(f"Processed x.shape: {x.shape}, y: {y}")
-                data_time += time.time() - data_start
-                self.model.train()
-                self.step += 1
+            with tqdm(total=len(train_loader), desc=f"Epoch {epoch + 1}") as pbar:
+                for i, (x, y) in enumerate(train_loader):
+                    x = x.flatten(start_dim=0, end_dim=1) if x.ndim == 5 else x
+                    data_time += time.time() - data_start
+                    self.model.train()
+                    self.step += 1
 
-                x = x.to(self.device)
+                    x = x.to(self.device)
 
-                output = self.model(x) # [B, 2*C, H, W] for training, [B, C, H, W] for inference
-                # noise_loss, photo_loss, frequency_loss, col_loss = self.estimation_loss(x, output)
-                noise_loss, photo_loss, frequency_loss, perc_loss, col_loss = self.estimation_loss(x, output)
-                # Balanced loss weighting (no vlb in old commit)
-                noise = noise_loss
-                photo = photo_loss
-                freq = frequency_loss
-                percep = perc_loss
-                color = col_loss
-                loss = (
-                    noise 
-                    + 0.5*photo 
-                    + 0.1*freq 
-                    + 0.2 * percep 
-                    + 0.2 * color
-                )
-                    # Check for NaN values and skip if found
-                if torch.isnan(loss) or torch.isinf(loss):
-                    print(f"Warning: NaN or Inf detected in loss at step {self.step}")
-                    print(f"noise: {noise.item()}, photo: {photo.item()}, freq: {freq.item()}, color: {color.item()}")
-                    # print(f"noise: {noise.item()}, photo: {photo.item()}, freq: {freq.item()}, percep: {percep.item()}, color: {color.item()}")
-                    continue
+                    output = self.model(x)
 
-                if self.step % 10 == 0:
-                    # print("step:{}, lr:{:.6f}, loss:{:.4f}, noise:{:.4f}, photo:{:.4f}, "
-                    #       "freq:{:.4f}, percep:{:.4f}, color:{:.4f}".format(self.step, self.scheduler.get_last_lr()[0],
-                    #                                  loss.item(),
-                    #                                  noise_loss.item(), photo_loss.item(),
-                    #                                  frequency_loss.item(),
-                    #                                  percep.item(),
-                    #                                  col_loss.item()))
-                    # wandb logging
-                    if wandb.run is not None:
+                    total_loss, noise_loss, photo_loss, frequency_loss, color_loss_val, perceptual_loss_val  = self.estimation_loss(x, output)
+
+                    # loss = noise_loss + photo_loss + frequency_loss
+                    loss = total_loss
+                    if self.step % 10 == 0:
+                        # print("step:{}, lr:{:.6f}, noise_loss:{:.4f}, photo_loss:{:.4f}, frequency_loss:{:.4f}, color_loss:{:.4f}, perceptual_loss:{:.4f}".format(
+                        #     self.step,
+                        #     self.scheduler.get_last_lr()[0],
+                        #     noise_loss.item(),
+                        #     photo_loss.item(),
+                        #     frequency_loss.item(),
+                        #     color_loss_val.item(),
+                        #     perceptual_loss_val.item()
+                        # ))
                         wandb.log({
-                            'loss': loss.item(),
-                            'noise_loss': noise_loss.item(),
-                            'photo_loss': photo_loss.item(),
-                            'frequency_loss': frequency_loss.item(),
-                            'perceptual_loss': percep.item(),
-                            'col_loss': col_loss.item(),
-                            'lr': self.scheduler.get_last_lr()[0],
-                            'epoch': epoch,
-                            'step': self.step
+                            "step": self.step,
+                            "lr": self.scheduler.get_last_lr()[0],
+                            "noise_loss": noise_loss.item(),
+                            "photo_loss": photo_loss.item(),
+                            "frequency_loss": frequency_loss.item(),
+                            "color_loss": color_loss_val.item(),
+                            "perceptual_loss": perceptual_loss_val.item(),
+                            "total_loss": total_loss.item()
                         })
+                    self.optimizer.zero_grad()
+                    loss.backward()
+                    self.optimizer.step()
+                    self.ema_helper.update(self.model)
+                    pbar.update(1)
+                    pbar.set_postfix(loss=total_loss.item())
+                    data_start = time.time()
 
-                self.optimizer.zero_grad()
-                loss.backward()
-                self.optimizer.step()
-                self.ema_helper.update(self.model)
-                
-                data_start = time.time()
-
-                
-                # Compute total gradient norm before clipping
-                # scaler.unscale_(self.optimizer)
-                # total_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                # if total_norm > 1.0:
-                #     print(f"Warning: Gradient norm ({total_norm:.4f}) exceeded max_norm before clipping at step {self.step}")
-
-                # if self.step % self.config.training.validation_freq == 0 and self.step != 0:
-                #     self.model.eval()
-                #     self.sample_validation_patches(val_loader, self.step)
-
-            if (epoch+1) % 4 == 0:
-                utils.logging.save_checkpoint({'step': self.step, 'epoch': epoch + 1,
-                                                'state_dict': self.model.state_dict(),
-                                                'optimizer': self.optimizer.state_dict(),
-                                                'scheduler': self.scheduler.state_dict(),
-                                                'ema_helper': self.ema_helper.state_dict(),
-                                                'params': self.args,
-                                                'config': self.config},
-                                                filename=os.path.join(self.config.data.ckpt_dir, "latest"))
-            if (epoch+1) % 50 == 0:
-                utils.logging.save_checkpoint({'step': self.step, 'epoch': epoch + 1,
-                                                'state_dict': self.model.state_dict(),
-                                                'optimizer': self.optimizer.state_dict(),
-                                                'scheduler': self.scheduler.state_dict(),
-                                                'ema_helper': self.ema_helper.state_dict(),
-                                                'params': self.args,
-                                                'config': self.config},
-                                                filename=os.path.join(self.config.data.ckpt_dir, str(epoch + 1)))
+                    if self.step % self.config.training.validation_freq == 0 and self.step != 0:
+                        # self.model.eval()
+                        # self.sample_validation_patches(val_loader, self.step)
+                        ckpt_filename = 'model_latest.pth.tar'
+                        ckpt_path = os.path.join(self.config.data.ckpt_dir, ckpt_filename)
+                        print(f"Saving checkpoint to: {ckpt_path}")
                         
-            self.scheduler.step()
+                        # Save the checkpoint
+                        utils.logging.save_checkpoint({
+                            'step': self.step,
+                            'epoch': epoch + 1,
+                            'state_dict': self.model.state_dict(),
+                            'optimizer': self.optimizer.state_dict(),
+                            'scheduler': self.scheduler.state_dict(),
+                            'ema_helper': self.ema_helper.state_dict(),
+                            'params': self.args,
+                            'config': self.config
+                        }, filename=os.path.join(self.config.data.ckpt_dir, 'model_latest'))
+                        
+                        # Save to wandb as an artifact using the correct file path
+                        # artifact = wandb.Artifact('model-checkpoint', type='model')
+                        # artifact.add_file(ckpt_path)
+                        # wandb.log_artifact(artifact)
+                                                    
+                self.scheduler.step()
 
     def estimation_loss(self, x, output):
+        # Original outputs from the model
+        input_high0, input_high1, gt_high0, gt_high1 = (
+            output["input_high0"], output["input_high1"],
+            output["gt_high0"], output["gt_high1"]
+        )
 
-        input_highs = output["input_highs"]
-        gt_highs = output["gt_highs"]
+        pred_LL, gt_LL, pred_x, noise_output, e = (
+            output["pred_LL"], output["gt_LL"],
+            output["pred_x"], output["noise_output"], output["e"]
+        )
 
-        denoised_LL, pred_x, noise_output, e = output["denoised_LL"], output["pred_x"], output["noise_output"], output["e"]
-        final_gt_LL = output["final_gt_LL"]
-
+        # Ground truth image
         gt_img = x[:, 3:, :, :].to(self.device)
-        # =============noise loss==================
+
+        # ============= Noise Loss ===================
         noise_loss = self.l2_loss(noise_output, e)
 
-        # =============frequency loss==================
-        frequency_loss_l2 = self.l2_loss(denoised_LL, final_gt_LL)
-        frequency_loss_tv = self.TV_loss(denoised_LL)
+        # ============= Frequency Loss ===================
+        # frequency_loss = 0.1 * (self.l2_loss(input_high0, gt_high0) +
+        #                         self.l2_loss(input_high1, gt_high1) +
+        #                         self.l2_loss(pred_LL, gt_LL)) + \
+        #                 0.01 * (self.TV_loss(input_high0) +
+        #                         self.TV_loss(input_high1) +
+        #                         self.TV_loss(pred_LL))
+        # Split L2 and TV more explicitly
+        l2_HF = self.l2_loss(input_high0, gt_high0) + self.l2_loss(input_high1, gt_high1)
+        tv_HF = self.TV_loss(input_high0) + self.TV_loss(input_high1)
 
-        for i in range(len(input_highs)):
-            frequency_loss_l2 += self.l2_loss(input_highs[i], gt_highs[i])
-            frequency_loss_tv += self.TV_loss(input_highs[i])
+        # Optional: LL supervision can stay light if haze is already solved
+        l2_LL = self.l2_loss(pred_LL, gt_LL)
+        tv_LL = self.TV_loss(pred_LL)
 
-        # Normalize TV loss by number of high-frequency components
-        # frequency_loss_tv = frequency_loss_tv / (len(input_highs) + 1)
-        frequency_loss = 0.1 * frequency_loss_l2 + 0.01 * frequency_loss_tv
 
-        # =============photo loss==================
+        # Edge loss for high-frequency components
+        L_edge = self.edge_loss(input_high0, gt_high0) + self.edge_loss(input_high1, gt_high1)
+
+        frequency_loss = (
+            1.0 * l2_HF +          # ↑ from 0.1 to 1.0
+            0.1 * tv_HF +          # ↑ from 0.01 to 0.1
+            0.2 * l2_LL +          # optional — keep this weaker
+            0.01 * tv_LL           # optional — very light TV on LL
+        )
+        frequency_loss += 0.2 * L_edge
+
+        # ============= Photometric Loss ===================
+        # Content loss (L1)
         content_loss = self.l1_loss(pred_x, gt_img)
-        if content_loss < 0 or content_loss > 1:
-            print(f"Warning: Content loss value out of [0,1] range: {content_loss.item()}")
-            print(f"pred_x: {pred_x.min().item()} to {pred_x.max().item()}, mean: {pred_x.mean().item()}, var: {pred_x.var().item()}")
-
-        ssim_val = ssim(pred_x, gt_img, data_range=1.0).to(self.device)
-        if ssim_val < 0 or ssim_val > 1:
-            print(f"Warning: SSIM loss value out of [0,1] range: {ssim_val.item()}")
-            print(f"pred_x: {pred_x.min().item()} to {pred_x.max().item()}, mean: {pred_x.mean().item()}, var: {pred_x.var().item()}")
-        
-        ssim_loss = 1 - torch.clamp(ssim_val, min=0, max=1)
+        # SSIM loss
+        ssim_loss = 1 - ssim(pred_x, gt_img, data_range=1.0).to(self.device)
         photo_loss = content_loss + ssim_loss
 
-        # =============perceptual loss==================
-        perce_loss = perceptual_loss(pred_x, gt_img, self.feature_extractor)
+        # ============= Color Loss ===================
+        color_loss_val = self.color_loss(pred_x, gt_img)
 
-        # =============color loss==================
-        col_loss = self.color_loss(pred_x, gt_img)
+        # ============= Perceptual Loss ===================
+        perceptual_loss_val = perceptual_loss(pred_x, gt_img, self.feature_extractor)
 
-        # return noise_loss, photo_loss, frequency_loss, col_loss
-        return noise_loss, photo_loss, frequency_loss, perce_loss, col_loss
+        # Combine losses
+        total_loss = (
+            noise_loss +
+            0.5 * frequency_loss +
+            0.5 * photo_loss +
+            0.2 * color_loss_val +
+            0.2 * perceptual_loss_val
+        )
+
+        return total_loss, noise_loss, photo_loss, frequency_loss, color_loss_val, perceptual_loss_val
+
 
     def sample_validation_patches(self, val_loader, step):
+        image_folder = os.path.join(self.args.image_folder, self.config.data.type + str(self.config.data.patch_size))
         self.model.eval()
-        image_folder = os.path.join(self.args.image_folder, 
-                                  f"{self.config.data.type}{self.config.data.patch_size}")
+        all_metrics = []
         with torch.no_grad():
+            tqdm.write(f"Processing a single batch of validation images at step: {step}")
             for i, (x, y) in enumerate(val_loader):
                 b, _, img_h, img_w = x.shape
-                x = F.pad(x, 
-                         (0, 32 * ((img_w + 31) // 32) - img_w,
-                          0, 32 * ((img_h + 31) // 32) - img_h),
-                         'reflect')
-                out = self.model(x.to(self.device))
-                pred_x = out["pred_x"][:, :, :img_h, :img_w]
-                utils.logging.save_image(
-                    pred_x, 
-                    os.path.join(image_folder, str(step), f"{y[0]}.png")
-                )
-                break  # Process only one batch
+                img_h_32 = int(32 * np.ceil(img_h / 32.0))
+                img_w_32 = int(32 * np.ceil(img_w / 32.0))
+                x = F.pad(x, (0, img_w_32 - img_w, 0, img_h_32 - img_h), 'reflect')
+
+                # Input and Ground-Truth Split
+                x_cond = x[:, :3, :, :].to(self.device)  # Input
+                gt = x[:, 3:, :, :].to(self.device)  # Ground truth
+
+                # Forward pass through the model
+                output = self.model(x_cond)
+                pred_x = output["pred_x"]
+                pred_x = pred_x[:, :, :img_h, :img_w]
+
+                # Save the restored image
+                save_path = os.path.join(image_folder, str(step), f"{y[0]}.png")
+                utils.logging.save_image(pred_x, save_path)
+                # Evaluate metrics for the current sample
+                sample_metrics = metrics.evaluate_metrics(pred_x, gt)
+                all_metrics.append(sample_metrics)  # Append metrics for aggregation later
+
+                # Print each sample's metrics for debugging (optional)
+                # print(f"Metrics for {y[0]}: {sample_metrics}")
+
+        # Aggregate metrics over the dataset
+        avg_metrics = {key: np.mean([m[key] for m in all_metrics]) for key in all_metrics[0]}
+
+        # Log average metrics to WandB
+        tqdm.write(f"Step {step}: Average Metrics: {avg_metrics}")
+        wandb.log({"average_metrics": avg_metrics, "step": step})
 
 
+'''
+class DummyConfig:
+    class Diffusion:
+        beta_schedule = "linear"
+        beta_start = 0.0001
+        beta_end = 0.02
+        num_diffusion_timesteps = 1000
+    class data:
+        conditional = True
+        pass
+
+    class model:        
+            in_channels=3
+            out_ch=3
+            ch= 64
+            ch_mult= [1, 2, 3, 4]
+            num_res_blocks= 2
+            dropout= 0.0
+            ema_rate= 0.999
+            ema= True
+            resamp_with_conv= True
+    # class device:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    diffusion = Diffusion()
+    # device = Device()
+
+class DummyArgs:
+    sampling_timesteps = 100
+
+# Initialize dummy arguments and configuration
+args = DummyArgs()
+config = DummyConfig()
+
+# Create a dummy input tensor
+# The model expects a 6-channel input during training (3 for input, 3 for ground truth)
+dummy_input = torch.randn(1, 6, 64, 64).to(config.device)
+
+# Initialize the Net class
+net = Net(args, config).to(config.device)
+
+# Forward pass through the network
+output = net(dummy_input)
+
+# Print the shapes of each layer's output
+print("Input shape:", dummy_input.shape)
+# The dummy code runs in training mode, which has more outputs in the dictionary
+if net.training:
+    print("Output shape:", output["pred_x"].shape)
+    print("Input high0 shape:", output["input_high0"].shape)
+    print("Input high1 shape:", output["input_high1"].shape)
+    print("GT high0 shape:", output["gt_high0"].shape)
+    print("GT high1 shape:", output["gt_high1"].shape)
+    print("Pred LL shape:", output["pred_LL"].shape)
+    print("GT LL shape:", output["gt_LL"].shape)
+    print("Noise output shape:", output["noise_output"].shape)
+    print("E shape:", output["e"].shape)
+else:
+    print("Output shape:", output["pred_x"].shape)
+
+'''

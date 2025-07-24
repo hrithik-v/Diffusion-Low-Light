@@ -11,13 +11,17 @@ import models
 import datasets
 import utils
 from models import DenoisingDiffusion, DiffusiveRestoration
-
+import wandb
+from utils import metrics
+from tqdm import tqdm
+import os
+os.environ["WANDB_MODE"] = "disabled"
 
 def parse_args_and_config():
     parser = argparse.ArgumentParser(description='Evaluate Wavelet-Based Diffusion Model')
     parser.add_argument("--config", default='LOLv1.yml', type=str,
                         help="Path to the config file")
-    parser.add_argument('--resume', default='ckpt/model.pth.tar', type=str,
+    parser.add_argument('--resume', default='ckpt/model_latest.pth.tar', type=str,
                         help='Path for the diffusion model checkpoint to load for evaluation')
     parser.add_argument("--sampling_timesteps", type=int, default=10,
                         help="Number of implicit sampling steps")
@@ -47,6 +51,8 @@ def dict2namespace(config):
 
 def main():
     args, config = parse_args_and_config()
+    wandb.init(project="wavelet_diffusion", config=config, name="evaluation_run")
+    wandb.config.update(args)
 
     # setup device to run
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
@@ -61,7 +67,7 @@ def main():
     np.random.seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
-    torch.backends.cudnn.benchmark = True
+    # torch.backends.cudnn.benchmark = True
 
     # data loading
     print("=> using dataset '{}'".format(config.data.val_dataset))
@@ -73,6 +79,7 @@ def main():
     diffusion = DenoisingDiffusion(args, config)
     model = DiffusiveRestoration(diffusion, args, config)
     model.restore(val_loader)
+
 
 
 if __name__ == '__main__':

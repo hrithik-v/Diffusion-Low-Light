@@ -1,18 +1,18 @@
 import random
 import torchvision.transforms as transforms
 import torchvision.transforms.functional as F
-from PIL import Image
 
 
 class PairRandomCrop(transforms.RandomCrop):
 
     def __call__(self, image, label):
-        # Automatically resize if smaller than crop size
-        # self.size is (height, width)
-        h, w = self.size if isinstance(self.size, (list, tuple)) else (self.size, self.size)
-        if image.width < w or image.height < h:
-            image = image.resize((max(w, image.width), max(h, image.height)), Image.BICUBIC)
-            label = label.resize((max(w, label.width), max(h, label.height)), Image.BICUBIC)
+
+
+        if image.size[0] < self.size[1] or image.size[1] < self.size[0]:
+            new_width = max(self.size[1], image.size[0])
+            new_height = max(self.size[0], image.size[1])
+            image = F.resize(image, (new_height, new_width))
+            label = F.resize(label, (new_height, new_width))
 
         if self.padding is not None:
             image = F.pad(image, self.padding, self.fill, self.padding_mode)
@@ -78,17 +78,14 @@ class PairToTensor(transforms.ToTensor):
         """
         return F.to_tensor(pic), F.to_tensor(label)
 
-
 class PairResize:
-    """
-    Resize both image and label to a given size.
-    """
-    def __init__(self, size, interpolation=2):  # 2 = BILINEAR in PIL
-        self.size = size
-        # Use BILINEAR interpolation as default (matching PIL.Image.BILINEAR)
-        self.interpolation = interpolation
+    def __init__(self, size):
+        if isinstance(size, int):
+            self.size = (size, size)
+        else:
+            self.size = size
 
     def __call__(self, image, label):
-        # Explicitly use the numerical value for interpolation 
-        return F.resize(image, self.size, self.interpolation), \
-               F.resize(label, self.size, self.interpolation)
+        image = F.resize(image, self.size)
+        label = F.resize(label, self.size)
+        return image, label

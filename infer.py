@@ -1,125 +1,120 @@
+#!/usr/bin/env python3
+"""
+Inference script to generate and save a grid of images: original, ground truth, and generated outputs.
+"""
 import argparse
 import os
+import yaml
 import torch
 import numpy as np
-import matplotlib.pyplot as plt
-from models import DenoisingDiffusion
+import torch.nn.functional as F
+import torchvision.utils as tvu
 import datasets
-import utils
+from models import DenoisingDiffusion, DiffusiveRestoration
 
-def dict2namespace(config):
-    import argparse
-    namespace = argparse.Namespace()
-    for key, value in config.items():
-        if isinstance(value, dict):
-            new_value = dict2namespace(value)
+# Disable wandb logging
+os.environ["WANDB_MODE"] = "disabled"
+
+def parse_args_and_config():
+    parser = argparse.ArgumentParser(description='Inference: generate image grid')
+    parser.add_argument("--config", default='LOLv1.yml', type=str,
+                        help="Path to the config file under configs/")
+    parser.add_argument('--resume', default='ckpt/Transf_LSUI/model_latest.pth.tar', type=str,
+                        help='Path to the diffusion model checkpoint')
+    parser.add_argument("--sampling_timesteps", type=int, default=10,
+                        help="Number of sampling steps for diffusion")
+    parser.add_argument("--image_folder", default='samples', type=str,
+                        help="Directory to save output grid image")
+    parser.add_argument('--seed', default=None, type=int,
+                        help='Random seed')
+    parser.add_argument('--num_samples', type=int, default=5,
+                        help='Number of samples to include in grid')
+    args = parser.parse_args()
+
+    # load yaml config
+    with open(os.path.join("configs", args.config), "r") as f:
+        raw = yaml.safe_load(f)
+    config = dict2namespace(raw)
+    return args, config
+
+
+def dict2namespace(cfg):
+    ns = argparse.Namespace()
+    for k, v in cfg.items():
+        if isinstance(v, dict):
+            setattr(ns, k, dict2namespace(v))
         else:
-            new_value = value
-        setattr(namespace, key, new_value)
-    return namespace
-
-def load_config(config_path):
-    import yaml
-    with open(config_path, "r") as f:
-        config = yaml.safe_load(f)
-    return dict2namespace(config)
-
-def save_grid(org_imgs, gt_imgs, gen_imgs, n, out_path, ckpt_step):
-    import imageio, os, cv2  # noqa: F401
-    from skimage.metrics import peak_signal_noise_ratio, structural_similarity
-    os.makedirs(out_path, exist_ok=True)
-    rows = []
-    for i in range(n):
-        orig = np.clip(org_imgs[i], 0, 1)
-        gt = np.clip(gt_imgs[i], 0, 1)
-        gen = np.clip(gen_imgs[i], 0, 1)
-        # Compute PSNR and SSIM between gt and generated
-        psnr = peak_signal_noise_ratio(gt, gen, data_range=1.0)
-        ssim = structural_similarity(gt, gen, data_range=1.0, channel_axis=2)
-        # Create a blank annotation image
-        H, W, _ = gt.shape
-        blank_uint = np.ones((H, W, 3), dtype=np.uint8) * 255
-        text = f"PSNR:{psnr:.2f} SSIM:{ssim:.4f}"
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 0.6
-        thickness = 1
-        text_size, _ = cv2.getTextSize(text, font, font_scale, thickness)
-        text_w, text_h = text_size
-        org_x = max((W - text_w) // 2, 0)
-        org_y = max((H + text_h) // 2, text_h)
-        cv2.putText(blank_uint, text, (org_x, org_y), font, font_scale, (0, 0, 0), thickness, cv2.LINE_AA)
-        blank = blank_uint.astype(np.float32) / 255.0
-        # Concatenate original, gt, generated, and metrics images
-        row = np.concatenate([orig, gt, gen, blank], axis=1)
-        rows.append(row)
-    grid = np.concatenate(rows, axis=0)  # Stack rows vertically
-    grid = (grid * 255).astype(np.uint8)
-    imageio.imwrite(os.path.join(out_path, f'{ckpt_step}.png'), grid)
+            setattr(ns, k, v)
+    return ns
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Inference and visualization for DenoisingDiffusion")
-    parser.add_argument("--config", type=str, default="configs/LOLv1.yml", help="Path to config YAML file")
-    parser.add_argument("--run_name", type=str, default="Diff_UNet_LSUI_13_07", help="Name of the run (used for ckpt and output dir)")
-    parser.add_argument("--ckpt_step", type=str, default="latest", help="Checkpoint step (used for ckpt filename)")
-    parser.add_argument("--num_samples", type=int, default=8, help="Number of samples to visualize")
-    parser.add_argument("--sampling_timesteps", type=int, default=10)
-    parser.add_argument("--seed", type=int, default=None, help="Manual seed for reproducibility (default: None, uses system time)")
-    args = parser.parse_args()
-
-    # Construct ckpt path and output dir from run_name and ckpt_step
-    args.ckpt = f"ckpt/{args.run_name}/{args.ckpt_step}.pth.tar"
-    output_dir = f"samples/{args.run_name}"
-
-    config = load_config(args.config)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    args, config = parse_args_and_config()
+    # device setup
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    print(f"Using device: {device}")
     config.device = device
 
-    # Load dataset
-    DATASET = datasets.__dict__[config.data.type](config)
-    _, val_loader = DATASET.get_loaders()
-
-    # Load model
-    diffusion = DenoisingDiffusion(args, config)
-    ckpt_path = args.ckpt
-    if ckpt_path is None:
-        # Try to find latest checkpoint
-        ckpt_dir = getattr(config.data, 'ckpt_dir', 'checkpoints')
-        if not os.path.exists(ckpt_dir):
-            raise FileNotFoundError("No checkpoint directory found.")
-        ckpts = [os.path.join(ckpt_dir, f) for f in os.listdir(ckpt_dir) if f.endswith('.pth') or f.endswith('.pt') or f.isdigit()]
-        if not ckpts:
-            raise FileNotFoundError("No checkpoint found in directory.")
-        ckpt_path = max(ckpts, key=os.path.getctime)
-        print(f"Using latest checkpoint: {ckpt_path}")
-    diffusion.load_ddm_ckpt(ckpt_path, ema=True)
-
-    # Randomly select indices for sampling
-    val_dataset = val_loader.dataset
-    total = len(val_dataset)
+    # seed
     if args.seed is not None:
+        torch.manual_seed(args.seed)
         np.random.seed(args.seed)
+        
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
+
+    # data loader
+    print(f"=> using dataset '{config.data.val_dataset}' for inference")
+    dataset = datasets.__dict__[config.data.type](config)
+    train_loader, val_loader = dataset.get_loaders(parse_patches=False)
+    # if no validation samples, fallback to training set
+    if len(val_loader.dataset) == 0:
+        print("No validation images found, using training set for inference")
+        loader = train_loader
     else:
-        np.random.seed()  # Use system time or OS entropy
-    sample_indices = np.random.choice(total, size=args.num_samples, replace=False)
+        loader = val_loader
 
-    org_imgs, gt_imgs, gen_imgs = [], [], []
-    for idx in sample_indices:
-        x, y = val_dataset[idx]
-        x = x.unsqueeze(0).to(device)
-        print("x shape:", x.shape)
-        with torch.no_grad():
-            out = diffusion.model(x)
-            pred_x = out["pred_x"].cpu().numpy()[0]
-        org = x[0, :3, :, :].cpu().numpy()
-        gt = x[0, 3:, :, :].cpu().numpy()
-        org_imgs.append(np.transpose(org, (1,2,0)))
-        gt_imgs.append(np.transpose(gt, (1,2,0)))
-        gen_imgs.append(np.transpose(pred_x, (1,2,0)))
+    # model
+    print("=> creating diffusion restoration model")
+    diffusion = DenoisingDiffusion(args, config)
+    model = DiffusiveRestoration(diffusion, args, config)
 
-    # make directory if not exist
-    os.makedirs(output_dir, exist_ok=True)
-    save_grid(org_imgs, gt_imgs, gen_imgs, args.num_samples, out_path=output_dir, ckpt_step=args.ckpt_step)
+    # collect images (flatten batches so each tensor is CxHxW)
+    images = []
+    count = 0
+    with torch.no_grad():
+        for batch in loader:
+            x_batch, _ = batch
+            b, _, h, w = x_batch.shape
+            for i in range(b):
+                if count >= args.num_samples:
+                    break
+                sample = x_batch[i:i+1].to(device)
+                x_cond = sample[:, :3, :, :]
+                gt = sample[:, 3:, :, :]
+                # pad to multiple of 32
+                pad_h = int(32 * np.ceil(h / 32.0)) - h
+                pad_w = int(32 * np.ceil(w / 32.0)) - w
+                x_pad = F.pad(x_cond, (0, pad_w, 0, pad_h), 'reflect')
+                out = model.diffusive_restoration(x_pad)
+                out = out[:, :, :h, :w]
+                # convert to CPU and squeeze batch dimension
+                images.extend([x_cond.cpu().squeeze(0), gt.cpu().squeeze(0), out.cpu().squeeze(0)])
+                count += 1
+            if count >= args.num_samples:
+                break
 
-if __name__ == "__main__":
+    # save grid
+    os.makedirs(args.image_folder, exist_ok=True)
+    grid = tvu.make_grid(images, nrow=3, padding=2)
+    # Extract path after 'ckpt/' for naming
+    resume_rel = args.resume.split('ckpt/', 1)[-1].split(".")[:-2][0] #.replace('/', '_')
+    out_path = f'samples/grid_{resume_rel}.png'
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    tvu.save_image(grid, out_path)
+    print(f"Saved grid of {args.num_samples} samples to {out_path}")
+
+
+if __name__ == '__main__':
     main()

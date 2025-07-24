@@ -1,18 +1,45 @@
+#!/usr/bin/env python3
+"""
+Validation script to compute average PSNR and SSIM over the validation dataset.
+"""
 import argparse
 import os
+import yaml
 import torch
 import numpy as np
 import torch.nn.functional as F
-from pytorch_msssim import ssim
-from models import DenoisingDiffusion
-import datasets
-from torch.utils.data import DataLoader
-import utils
+from tqdm import tqdm
 
-def dict2namespace(config):
-    import argparse
+import datasets
+from models import DenoisingDiffusion, DiffusiveRestoration
+from utils.metrics import compute_psnr, compute_ssim
+
+# Disable wandb logging
+os.environ["WANDB_MODE"] = "disabled"
+
+def parse_args_and_config():
+    parser = argparse.ArgumentParser(description='Validation: compute PSNR and SSIM')
+    parser.add_argument("--config", default='LOLv1.yml', type=str,
+                        help="Path to the config file under configs/")
+    parser.add_argument("--resume", required=True, type=str,
+                        help="Path to the diffusion model checkpoint")
+    parser.add_argument("--sampling_timesteps", type=int, default=10,
+                        help="Number of sampling steps for diffusion")
+    parser.add_argument('--seed', default=230, type=int,
+                        help='Random seed')
+    args = parser.parse_args()
+
+    # load yaml config
+    cfg_path = os.path.join("configs", args.config)
+    with open(cfg_path, "r") as f:
+        raw = yaml.safe_load(f)
+    config = dict2namespace(raw)
+    return args, config
+
+
+def dict2namespace(cfg):
     ns = argparse.Namespace()
-    for k, v in config.items():
+    for k, v in cfg.items():
         if isinstance(v, dict):
             setattr(ns, k, dict2namespace(v))
         else:
@@ -20,84 +47,73 @@ def dict2namespace(config):
     return ns
 
 
-def load_config(path):
-    import yaml
-    with open(path, 'r') as f:
-        cfg = yaml.safe_load(f)
-    return dict2namespace(cfg)
-
-
-    # python val.py --run_name 3rd_run --ckpt_step 300 --batch_size 8
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default='configs/LOLv1.yml')
-    parser.add_argument('--run_name', type=str, required=True,
-                        help='Name of the run (subfolder under ckpt/)')
-    parser.add_argument('--ckpt_step', type=str,
-                        help='Specific checkpoint step (e.g. 180). If omitted, use latest.')
-    parser.add_argument('--batch_size', type=int, default=1)
-    parser.add_argument('--sampling_timesteps', type=int, default=40,
-                        help='Number of diffusion sampling steps (reverse)')
-    args = parser.parse_args()
+    args, config = parse_args_and_config()
 
-    # load config and device
-    config = load_config(args.config)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # device setup
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    print(f"Using device: {device}")
     config.device = device
 
-    # checkpoint selection
-    ckpt_dir = os.path.join('ckpt', args.run_name)
-    if args.ckpt_step:
-        ckpt_file = f"{args.ckpt_step}.pth.tar"
+    # seeds
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
+    # data loader
+    print(f"=> using dataset '{config.data.val_dataset}' for validation")
+    dataset = datasets.__dict__[config.data.type](config)
+    train_loader, val_loader = dataset.get_loaders(parse_patches=False)
+    # fallback to training set if no validation samples
+    if len(val_loader.dataset) == 0:
+        print("No validation images found, using training set for validation")
+        loader = train_loader
     else:
-        files = [f for f in os.listdir(ckpt_dir) if f.endswith('.pth') or f.endswith('.pth.tar')]
-        ckpt_file = max(files, key=lambda f: os.path.getctime(os.path.join(ckpt_dir, f)))
-    ckpt_path = os.path.join(ckpt_dir, ckpt_file)
-    print(f"Using checkpoint: {ckpt_path}")
+        loader = val_loader
 
-    # prepare data loader (override batch_size for validation)
-    DATASET = datasets.__dict__[config.data.type](config)
-    _, default_val_loader = DATASET.get_loaders()
-    val_dataset = default_val_loader.dataset
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=config.data.num_workers,
-        pin_memory=True
-    )
-
-    # build model and load checkpoint
+    # model setup
     diffusion = DenoisingDiffusion(args, config)
-    diffusion.load_ddm_ckpt(ckpt_path, ema=True)
-    # use model as defined in DenoisingDiffusion (already DataParallel if multi-GPU)
-    model = diffusion.model.to(device)
-    if torch.cuda.device_count() > 1:
-        print(f"Using {torch.cuda.device_count()} GPUs for inference.")
-    model.eval()
+    model = DiffusiveRestoration(diffusion, args, config)
+    model.diffusion.model.eval()
 
     psnr_vals = []
     ssim_vals = []
 
     with torch.no_grad():
-        for x, _ in val_loader:
-            x = x.to(device)
-            out = model(x)
-            pred = out['pred_x']
-            gt = x[:, 3:, :, :]
+        for x_batch, _ in tqdm(loader, desc="Validation"):  
+            x_cond = x_batch[:, :3, :, :].to(device)
+            gt = x_batch[:, 3:, :, :].to(device)
+            b, _, h, w = x_cond.shape
+            # pad to multiple of 32
+            pad_h = int(32 * np.ceil(h / 32.0)) - h
+            pad_w = int(32 * np.ceil(w / 32.0)) - w
+            x_pad = F.pad(x_cond, (0, pad_w, 0, pad_h), 'reflect')
 
-            # per-sample metrics
-            for i in range(pred.shape[0]):
-                p = pred[i:i+1]
-                g = gt[i:i+1]
-                mse = F.mse_loss(p, g)
-                psnr = 10 * torch.log10(1.0 / mse)
-                ssim_score = ssim(p, g, data_range=1.0)
-                psnr_vals.append(psnr.item())
-                ssim_vals.append(ssim_score.item())
+            # inference
+            out = model.diffusive_restoration(x_pad)
+            out = out[:, :, :h, :w]
 
-    print(f"Validation PSNR: {np.mean(psnr_vals):.4f} dB")
-    print(f"Validation SSIM: {np.mean(ssim_vals):.4f}")
+            # crop 20% from each border (left, right, top, bottom) to avoid border artifacts
+            # crop_w_start = int(0.3 * w)
+            # crop_w_end = int(0.7 * w)
+            # crop_h_start = int(0.3 * h)
+            # crop_h_end = int(0.7 * h)
+            # out_cropped = out[:, :, crop_h_start:crop_h_end, crop_w_start:crop_w_end]
+            # gt_cropped = gt[:, :, crop_h_start:crop_h_end, crop_w_start:crop_w_end]
+            out_cropped = out
+            gt_cropped = gt
+            # compute metrics on cropped images
+            psnr = compute_psnr(out_cropped, gt_cropped)
+            ssim = compute_ssim(out_cropped, gt_cropped)
+            psnr_vals.append(psnr)
+            ssim_vals.append(ssim)
+
+    avg_psnr = np.mean(psnr_vals)
+    avg_ssim = np.mean(ssim_vals)
+    print(f"Average PSNR over validation set: {avg_psnr:.4f}")
+    print(f"Average SSIM over validation set: {avg_ssim:.4f}")
+
 
 if __name__ == '__main__':
     main()

@@ -11,11 +11,13 @@ import torchvision
 import models
 import datasets
 import utils
-from models import DenoisingDiffusion
 import wandb
-# import os
-# os.environ["WANDB_MODE"] = "disabled"
 
+from models import DenoisingDiffusion
+from utils.metrics import evaluate_metrics
+
+
+# os.environ["WANDB_MODE"] = "disabled"
 
 def parse_args_and_config():
     parser = argparse.ArgumentParser(description='Training Wavelet-Based Diffusion Model')
@@ -23,7 +25,7 @@ def parse_args_and_config():
                         help="Path to the config file")
     parser.add_argument('--resume', default='', type=str,
                         help='Path for checkpoint to load and resume')
-    parser.add_argument("--sampling_timesteps", type=int, default=40,
+    parser.add_argument("--sampling_timesteps", type=int, default=10,
                         help="Number of implicit sampling steps for validation image patches")
     parser.add_argument("--image_folder", default='results/', type=str,
                         help="Location to save restored validation image patches")
@@ -51,6 +53,16 @@ def dict2namespace(config):
 
 def main():
     args, config = parse_args_and_config()
+    # wandb login and init
+    if hasattr(config, 'wandb'):
+        wandb.login(key=config.wandb.token)
+        wandb.init(
+            project="UIE_Diffusion",
+            name=getattr(config.wandb, 'name', None),
+            id=getattr(config.wandb, 'id', None),
+            resume=getattr(config.wandb, 'resume', False),
+            config=config
+        )
 
     # setup device to run
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
@@ -64,17 +76,6 @@ def main():
         torch.cuda.manual_seed_all(args.seed)
     # torch.backends.cudnn.benchmark = True
 
-    # wandb login and init
-    if hasattr(config, 'wandb'):
-        wandb.login(key=config.wandb.token)
-        wandb.init(
-            project="UIE_Diffusion",
-            name=getattr(config.wandb, 'name', None),
-            id=getattr(config.wandb, 'id', None),
-            resume=getattr(config.wandb, 'resume', False),
-            config=config
-        )
-
     # data loading
     print("=> using dataset '{}'".format(config.data.train_dataset))
     DATASET = datasets.__dict__[config.data.type](config)
@@ -84,9 +85,9 @@ def main():
     diffusion = DenoisingDiffusion(args, config)
     diffusion.train(DATASET)
 
+
     if hasattr(config, 'wandb'):
         wandb.finish()
-
 
 if __name__ == "__main__":
     main()
