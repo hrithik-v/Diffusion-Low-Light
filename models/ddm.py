@@ -275,6 +275,9 @@ class DenoisingDiffusion(object):
     
         self.feature_extractor = vgg16(pretrained=True).features.eval()
         self.feature_extractor.to(self.device)
+        # Parallelize the feature extractor too
+        if torch.cuda.device_count() > 1:
+            self.feature_extractor = torch.nn.DataParallel(self.feature_extractor)
         # Only optimize parameters that require grad (should be HFRM modules)
         # self.optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, self.model.parameters()), lr=1e-4)
         # self.scheduler = None  # No scheduler by default
@@ -323,13 +326,13 @@ class DenoisingDiffusion(object):
         return lab_img
     def load_ddm_ckpt(self, load_path, ema=False):
         checkpoint = utils.logging.load_checkpoint(load_path, None)
-        self.model.load_state_dict(checkpoint['state_dict'], strict=True)
-        self.ema_helper.load_state_dict(checkpoint['ema_helper'])
+        self.model.load_state_dict(checkpoint['state_dict'], strict=False)
+        # self.ema_helper.load_state_dict(checkpoint['ema_helper'])
         # Load epoch state if present
         if 'epoch' in checkpoint:
             self.start_epoch = checkpoint['epoch']
-        if ema:
-            self.ema_helper.ema(self.model)
+        # if ema:
+        #     self.ema_helper.ema(self.model)
         print("=> loaded checkpoint {} step {} epoch {}".format(load_path, self.step, getattr(self, 'start_epoch', 0)))
 
     def train(self, DATASET):
