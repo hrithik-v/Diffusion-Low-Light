@@ -1,13 +1,14 @@
 data:
     type: "LLdataset"
-    train_dataset: "LSUI"
-    val_dataset: "LSUI"
+    train_dataset: "Dataset"
+    val_dataset: "Dataset"
     patch_size: 256
     channels: 3
     dwt_levels: 2
     num_workers: 4
-    data_dir: "/home/mlr/nihal/underwater/image_dirs"
-    ckpt_dir: "ckpt/continued_Transf"
+    data_dir: "/kaggle/input/underwaterbenchmarkdataset"
+    ckpt_dir: "ckpt/UIEB_HFRMv2"
+    img_prefix: "uieb"
     conditional: True
 
 model:
@@ -28,14 +29,14 @@ diffusion:
     num_diffusion_timesteps: 200
 
 training:
-    batch_size: 24
-    n_epochs: 700
+    batch_size: 36
+    n_epochs: 500
     validation_freq: 1000
 
 optim:
     weight_decay: 0.000
     optimizer: "Adam"
-    lr: 0.00001
+    lr: 0.0001
     amsgrad: False
     eps: 0.00000001
     step_size: 50
@@ -43,6 +44,6 @@ optim:
 
 wandb:
     token: "8285c1e86ba66976957cd9bdbae9e646b37bba8f"
-    name: "continued_Transf"
+    name: "UIEB_HFRMv2"
     resume: true
-    id: "lfcgu453"
+    id: "odqw6vqw"

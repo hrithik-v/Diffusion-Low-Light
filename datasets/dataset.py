@@ -34,13 +34,16 @@ class LLdataset:
         # Use separate directories for train and val based on config
         train_root = os.path.join(self.config.data.data_dir, self.config.data.train_dataset)
         val_root   = os.path.join(self.config.data.data_dir, self.config.data.val_dataset)
+        img_prefix = getattr(self.config.data, 'img_prefix', None)
         # Create train and validation sets
         train_dataset = AllWeatherDataset(root_dir=train_root,
                                           patch_size=self.config.data.patch_size,
-                                          train=True)
+                                          train=True,
+                                          img_prefix=img_prefix)
         val_dataset   = AllWeatherDataset(root_dir=val_root,
                                           patch_size=self.config.data.patch_size,
-                                          train=False)
+                                          train=False,
+                                          img_prefix=img_prefix)
 
         train_loader = torch.utils.data.DataLoader(train_dataset,
                                                    batch_size=self.config.training.batch_size,
@@ -56,22 +59,28 @@ class LLdataset:
 
 
 class AllWeatherDataset(torch.utils.data.Dataset):
-    def __init__(self, root_dir, patch_size, train=True):
+    def __init__(self, root_dir, patch_size, train=True, img_prefix=None):
         super().__init__()
         self.root_dir = root_dir
         self.train = train
         self.patch_size = patch_size
+        self.img_prefix = img_prefix
 
         if self.train:
-            self.raw_dir = os.path.join(root_dir, 'train', 'raw')
-            self.ref_dir = os.path.join(root_dir, 'train', 'ref')
+            self.raw_dir = os.path.join(root_dir, 'train', 'input')
+            self.ref_dir = os.path.join(root_dir, 'train', 'target')
         else:
             # For validation or test phase
-            self.raw_dir = os.path.join(root_dir, 'val', 'raw')
-            self.ref_dir = os.path.join(root_dir, 'val', 'ref')
+            self.raw_dir = os.path.join(root_dir, 'testset(ref)/test-UIEB', 'input')
+            self.ref_dir = os.path.join(root_dir, 'testset(ref)/test-UIEB', 'target')
 
-        # Get list of raw images
-        self.input_names = sorted(glob.glob(os.path.join(self.raw_dir, '*.png')))
+        # Get list of raw images whose filename starts with img_prefix if provided
+        # Include all file types (png, jpg, etc.)
+        all_input_names = sorted(glob.glob(os.path.join(self.raw_dir, '*')))
+        if self.img_prefix is not None:
+            self.input_names = [x for x in all_input_names if os.path.basename(x).startswith(self.img_prefix)]
+        else:
+            self.input_names = all_input_names
         print("Found raw images:", len(self.input_names), "in", self.raw_dir)
 
         # For each raw image, assume ref image with the same name exists in ref_dir
