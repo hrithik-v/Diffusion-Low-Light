@@ -275,6 +275,10 @@ class DenoisingDiffusion(object):
     
         self.feature_extractor = vgg16(pretrained=True).features.eval()
         self.feature_extractor.to(self.device)
+
+        # Parallelize the feature extractor too
+        if torch.cuda.device_count() > 1:
+            self.feature_extractor = torch.nn.DataParallel(self.feature_extractor)
         # Only optimize parameters that require grad (should be HFRM modules)
         # self.optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, self.model.parameters()), lr=1e-4)
         # self.scheduler = None  # No scheduler by default
@@ -328,6 +332,14 @@ class DenoisingDiffusion(object):
         # Load epoch state if present
         if 'epoch' in checkpoint:
             self.start_epoch = checkpoint['epoch']
+        # Load training step if present
+        if 'step' in checkpoint:
+            self.step = checkpoint['step']
+        # Load optimizer and scheduler states if present
+        if 'optimizer' in checkpoint:
+            self.optimizer.load_state_dict(checkpoint['optimizer'])
+        if 'scheduler' in checkpoint:
+            self.scheduler.load_state_dict(checkpoint['scheduler'])
         if ema:
             self.ema_helper.ema(self.model)
         print("=> loaded checkpoint {} step {} epoch {}".format(load_path, self.step, getattr(self, 'start_epoch', 0)))
@@ -358,7 +370,7 @@ class DenoisingDiffusion(object):
 
                     # loss = noise_loss + photo_loss + frequency_loss
                     loss = total_loss
-                    if self.step % 10 == 0:
+                    if self.step % 20 == 0:
                         # print("step:{}, lr:{:.6f}, noise_loss:{:.4f}, photo_loss:{:.4f}, frequency_loss:{:.4f}, color_loss:{:.4f}, perceptual_loss:{:.4f}".format(
                         #     self.step,
                         #     self.scheduler.get_last_lr()[0],
@@ -386,24 +398,24 @@ class DenoisingDiffusion(object):
                     pbar.set_postfix(loss=total_loss.item())
                     data_start = time.time()
 
-                    if self.step % self.config.training.validation_freq == 0 and self.step != 0:
-                        # self.model.eval()
-                        # self.sample_validation_patches(val_loader, self.step)
-                        ckpt_filename = 'model_latest.pth.tar'
-                        ckpt_path = os.path.join(self.config.data.ckpt_dir, ckpt_filename)
-                        print(f"Saving checkpoint to: {ckpt_path}")
-                        
-                        # Save the checkpoint
-                        utils.logging.save_checkpoint({
-                            'step': self.step,
-                            'epoch': epoch + 1,
-                            'state_dict': self.model.state_dict(),
-                            'optimizer': self.optimizer.state_dict(),
-                            'scheduler': self.scheduler.state_dict(),
-                            'ema_helper': self.ema_helper.state_dict(),
-                            'params': self.args,
-                            'config': self.config
-                        }, filename=os.path.join(self.config.data.ckpt_dir, 'model_latest'))
+                if (epoch+1) % 15 == 0:
+                    # self.model.eval()
+                    # self.sample_validation_patches(val_loader, self.step)
+                    ckpt_filename = 'model_latest.pth.tar'
+                    ckpt_path = os.path.join(self.config.data.ckpt_dir, ckpt_filename)
+                    print(f"Saving checkpoint to: {ckpt_path}")
+                    
+                    # Save the checkpoint
+                    utils.logging.save_checkpoint({
+                        'step': self.step,
+                        'epoch': epoch + 1,
+                        'state_dict': self.model.state_dict(),
+                        'optimizer': self.optimizer.state_dict(),
+                        'scheduler': self.scheduler.state_dict(),
+                        'ema_helper': self.ema_helper.state_dict(),
+                        'params': self.args,
+                        'config': self.config
+                    }, filename=os.path.join(self.config.data.ckpt_dir, 'model_latest'))
                         
                         # Save to wandb as an artifact using the correct file path
                         # artifact = wandb.Artifact('model-checkpoint', type='model')
@@ -411,6 +423,44 @@ class DenoisingDiffusion(object):
                         # wandb.log_artifact(artifact)
                                                     
                 self.scheduler.step()
+                # Validation every 20 epochs: compute PSNR and SSIM on validation set
+                if (epoch + 1) % 20 == 0:
+                    self.model.eval()
+                    psnr_sum = 0.0
+                    ssim_sum = 0.0
+                    with torch.no_grad():
+                        for x, y in val_loader:
+                            x = x.flatten(start_dim=0, end_dim=1) if x.ndim == 5 else x
+                            x_cond = x[:, :3, :, :].to(self.device)
+                            gt = x[:, 3:, :, :].to(self.device)
+                            output = self.model(x_cond)
+                            pred = output["pred_x"]
+                            psnr_sum += metrics.compute_psnr(pred, gt)
+                            ssim_sum += metrics.compute_ssim(pred, gt)
+                    n = len(val_loader)
+                    avg_psnr = psnr_sum / n
+                    avg_ssim = ssim_sum / n
+                    print(f"Validation Epoch {epoch+1}: Avg PSNR: {avg_psnr:.4f}, Avg SSIM: {avg_ssim:.4f}")
+                    wandb.log({"val/psnr": avg_psnr, "val/ssim": avg_ssim, "epoch": epoch+1})
+                    self.model.train()
+
+            # saving ckpt after every 50 epochs
+            if (epoch + 1) % 50 == 0:
+                ckpt_filename = f'model_epoch_{epoch + 1}.pth.tar'
+                ckpt_path = os.path.join(self.config.data.ckpt_dir, ckpt_filename)
+                print(f"Saving checkpoint to: {ckpt_path}")
+
+                # Save the checkpoint
+                utils.logging.save_checkpoint({
+                    'step': self.step,
+                    'epoch': epoch + 1,
+                    'state_dict': self.model.state_dict(),
+                    'optimizer': self.optimizer.state_dict(),
+                    'scheduler': self.scheduler.state_dict(),
+                    'ema_helper': self.ema_helper.state_dict(),
+                    'params': self.args,
+                    'config': self.config
+                }, filename=os.path.join(self.config.data.ckpt_dir, f'model_epoch_{epoch + 1}'))                
 
     def estimation_loss(self, x, output):
         # Original outputs from the model
@@ -431,13 +481,6 @@ class DenoisingDiffusion(object):
         noise_loss = self.l2_loss(noise_output, e)
 
         # ============= Frequency Loss ===================
-        # frequency_loss = 0.1 * (self.l2_loss(input_high0, gt_high0) +
-        #                         self.l2_loss(input_high1, gt_high1) +
-        #                         self.l2_loss(pred_LL, gt_LL)) + \
-        #                 0.01 * (self.TV_loss(input_high0) +
-        #                         self.TV_loss(input_high1) +
-        #                         self.TV_loss(pred_LL))
-        # Split L2 and TV more explicitly
         l2_HF = self.l2_loss(input_high0, gt_high0) + self.l2_loss(input_high1, gt_high1)
         tv_HF = self.TV_loss(input_high0) + self.TV_loss(input_high1)
 

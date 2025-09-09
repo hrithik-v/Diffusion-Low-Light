@@ -1,14 +1,15 @@
 data:
     type: "LLdataset"
-    train_dataset: "LSUI"
-    val_dataset: "LSUI"
+    train_dataset: "Dataset"
+    val_dataset: "Dataset"
     patch_size: 256
     channels: 3
     dwt_levels: 2
     num_workers: 4
-    data_dir: "/home/mlr/nihal/underwater/image_dirs"
-    ckpt_dir: "ckpt/continued_Transf"
+    data_dir: "/kaggle/input/underwaterbenchmarkdataset"
+    ckpt_dir: "ckpt/diffLL_full_ds"
     conditional: True
+    img_prefix: "uieb"
 
 model:
     in_channels: 3
