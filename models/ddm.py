@@ -187,7 +187,10 @@ class Net(nn.Module):
             xt_next = at_next.sqrt() * x0_t + c1 * torch.randn_like(x) + c2 * et
             xs.append(xt_next.to(x.device))
 
-        return xs[-1]
+        # Return residual prediction: denoised LL minus input LL
+        final_pred = xs[-1]
+        residual_pred = final_pred - x_cond
+        return residual_pred
 
     def forward(self, x):
         data_dict = {}
@@ -226,9 +229,12 @@ class Net(nn.Module):
             # noise_output = self.Unet(torch.cat([input_LL_LL, x_gt], dim=1), t.float())
             t_embed = timestep_embedding(t.float(), 256)
             noise_output = self.ICDT(x_gt, input_LL_LL, t_embed)
-            denoise_LL_LL = self.sample_training(input_LL_LL, b)
+            # Residual correction for LL band
+            denoise_residual = self.sample_training(input_LL_LL, b)
+            # Predict clean LL as input + residual
+            pred_LL_LL = input_LL_LL + denoise_residual
 
-            pred_LL = idwt(torch.cat((denoise_LL_LL, input_high1), dim=0))
+            pred_LL = idwt(torch.cat((pred_LL_LL, input_high1), dim=0))
 
             pred_x = idwt(torch.cat((pred_LL, input_high0), dim=0))
             pred_x = inverse_data_transform(pred_x)
@@ -242,10 +248,17 @@ class Net(nn.Module):
             data_dict["noise_output"] = noise_output
             data_dict["pred_x"] = pred_x
             data_dict["e"] = e
+            # Additional LL-level outputs for residual supervision
+            data_dict["input_LL_LL"] = input_LL_LL
+            data_dict["pred_LL_LL"] = pred_LL_LL
+            data_dict["gt_LL_LL"] = gt_LL_LL
+            data_dict["residual_pred"] = denoise_residual
 
         else:
-            denoise_LL_LL = self.sample_training(input_LL_LL, b)
-            pred_LL = idwt(torch.cat((denoise_LL_LL, input_high1), dim=0))
+            # Inference: residual on LL
+            denoise_residual = self.sample_training(input_LL_LL, b)
+            pred_LL_LL = input_LL_LL + denoise_residual
+            pred_LL = idwt(torch.cat((pred_LL_LL, input_high1), dim=0))
             pred_x = idwt(torch.cat((pred_LL, input_high0), dim=0))
             pred_x = inverse_data_transform(pred_x)
 
@@ -366,7 +379,7 @@ class DenoisingDiffusion(object):
 
                     output = self.model(x)
 
-                    total_loss, noise_loss, photo_loss, frequency_loss, color_loss_val, perceptual_loss_val  = self.estimation_loss(x, output)
+                    total_loss, noise_loss, photo_loss, frequency_loss, color_loss_val, perceptual_loss_val, residual_loss  = self.estimation_loss(x, output)
 
                     # loss = noise_loss + photo_loss + frequency_loss
                     loss = total_loss
@@ -388,6 +401,7 @@ class DenoisingDiffusion(object):
                             "frequency_loss": frequency_loss.item(),
                             "color_loss": color_loss_val.item(),
                             "perceptual_loss": perceptual_loss_val.item(),
+                            "residual_loss": residual_loss.item(),
                             "total_loss": total_loss.item()
                         })
                     self.optimizer.zero_grad()
@@ -477,6 +491,10 @@ class DenoisingDiffusion(object):
         # Ground truth image
         gt_img = x[:, 3:, :, :].to(self.device)
 
+        # ============= Residual Loss ===================
+        # Supervise residual prediction at LL level
+        residual_gt = output["gt_LL_LL"] - output["input_LL_LL"]
+        residual_loss = self.l2_loss(output["residual_pred"], residual_gt)
         # ============= Noise Loss ===================
         noise_loss = self.l2_loss(noise_output, e)
 
@@ -513,8 +531,9 @@ class DenoisingDiffusion(object):
         # ============= Perceptual Loss ===================
         perceptual_loss_val = perceptual_loss(pred_x, gt_img, self.feature_extractor)
 
-        # Combine losses
+        # Combine losses (include residual_loss)
         total_loss = (
+            residual_loss +
             noise_loss +
             0.5 * frequency_loss +
             0.5 * photo_loss +
@@ -522,7 +541,7 @@ class DenoisingDiffusion(object):
             0.2 * perceptual_loss_val
         )
 
-        return total_loss, noise_loss, photo_loss, frequency_loss, color_loss_val, perceptual_loss_val
+        return total_loss, noise_loss, photo_loss, frequency_loss, color_loss_val, perceptual_loss_val, residual_loss
 
 
     def sample_validation_patches(self, val_loader, step):
