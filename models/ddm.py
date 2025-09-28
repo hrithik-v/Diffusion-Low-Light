@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
+from models.PPGB import PM
 import utils
 from models.unet import DiffusionUNet
 from models.icdt import ICDT, timestep_embedding
@@ -136,9 +137,12 @@ class Net(nn.Module):
         self.high_enhance0 = HFRM(in_channels=3, out_channels=64)
         self.high_enhance1 = HFRM(in_channels=3, out_channels=64)
         
-        icdt_img_size = config.data.patch_size // (2 ** config.data.dwt_levels)
-        self.ICDT = ICDT(latent_dim=3, img_size=icdt_img_size, patch_size=4)
-        # self.Unet = DiffusionUNet(config)
+        # icdt_img_size = config.data.patch_size // (2 ** config.data.dwt_levels)
+        # self.ICDT = ICDT(latent_dim=3, img_size=icdt_img_size, patch_size=4)
+        # Main U-Net for diffusion
+        self.Unet = DiffusionUNet(config)
+        # Physics prior generator (transmission + atmospheric maps)
+        self.condition_net = PM(input_channels=3)
 
         betas = get_beta_schedule(
             beta_schedule=config.diffusion.beta_schedule,
@@ -177,9 +181,16 @@ class Net(nn.Module):
             at_next = self.compute_alpha(b, next_t.long())
             xt = xs[-1].to(x.device)
 
-            # et = self.Unet(torch.cat([x_cond, xt], dim=1), t)
-            t_embed = timestep_embedding(t, 256)
-            et = self.ICDT(xt, x_cond, t_embed)
+            # predict physical priors on LL input
+            A_map, t_map = self.condition_net(x_cond)
+            # downsample priors to match LL resolution
+            t_ll = F.interpolate(t_map, size=x_cond.shape[-2:], mode='bilinear', align_corners=False)
+            A_ll = F.interpolate(A_map, size=x_cond.shape[-2:], mode='bilinear', align_corners=False)
+            # concatenate LL input, noise, and priors
+            unet_input = torch.cat([x_cond, xt, t_ll, A_ll], dim=1)
+            et = self.Unet(unet_input, t)
+            # t_embed = timestep_embedding(t, 256)
+            # et = self.ICDT(xt, x_cond, t_embed)
             x0_t = (xt - et * (1 - at).sqrt()) / at.sqrt()
 
             c1 = eta * ((1 - at / at_next) * (1 - at_next) / (1 - at)).sqrt()
@@ -226,9 +237,20 @@ class Net(nn.Module):
             gt_LL_LL, gt_high1 = gt_LL_dwt[:n, ...], gt_LL_dwt[n:, ...]
 
             x_gt = gt_LL_LL * a.sqrt() + e * (1.0 - a).sqrt()
-            # noise_output = self.Unet(torch.cat([input_LL_LL, x_gt], dim=1), t.float())
-            t_embed = timestep_embedding(t.float(), 256)
-            noise_output = self.ICDT(x_gt, input_LL_LL, t_embed)
+            # predict physical priors
+            # predict physical priors from raw hazy image
+            A_map, t_map = self.condition_net(input_img)
+            # downsample priors to LL resolution
+            t_ll = F.interpolate(t_map, size=input_LL_LL.shape[-2:], mode='bilinear', align_corners=False)
+            A_ll = F.interpolate(A_map, size=input_LL_LL.shape[-2:], mode='bilinear', align_corners=False)
+            # save priors for loss computation
+            data_dict['t_map'] = t_map
+            data_dict['A_map'] = A_map
+            # concatenate inputs for Unet
+            unet_input = torch.cat([input_LL_LL, x_gt, t_ll, A_ll], dim=1)
+            noise_output = self.Unet(unet_input, t.float())
+            # t_embed = timestep_embedding(t.float(), 256)
+            # noise_output = self.ICDT(x_gt, input_LL_LL, t_embed)
             # Residual correction for LL band
             denoise_residual = self.sample_training(input_LL_LL, b)
             # Predict clean LL as input + residual
@@ -540,6 +562,16 @@ class DenoisingDiffusion(object):
             0.2 * color_loss_val +
             0.2 * perceptual_loss_val
         )
+        # Physics reconstruction loss
+        t_map = output['t_map']
+        A_map = output['A_map']
+        input_img = x[:, :3, :, :].to(self.device)
+        recon_hazy = t_map * pred_x + (1.0 - t_map) * A_map
+        recon_loss = self.l1_loss(recon_hazy, input_img)
+        # Smoothness regularization on transmission map
+        tv_reg = torch.mean(torch.abs(t_map[:, :, :, :-1] - t_map[:, :, :, 1:])) + \
+                 torch.mean(torch.abs(t_map[:, :, :-1, :] - t_map[:, :, 1:, :]))
+        total_loss = total_loss + 0.5 * recon_loss + 0.01 * tv_reg
 
         return total_loss, noise_loss, photo_loss, frequency_loss, color_loss_val, perceptual_loss_val, residual_loss
 
