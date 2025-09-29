@@ -119,6 +119,14 @@ def get_beta_schedule(beta_schedule, *, beta_start, beta_end, num_diffusion_time
     elif beta_schedule == "sigmoid":
         betas = np.linspace(-6, 6, num_diffusion_timesteps)
         betas = sigmoid(betas) * (beta_end - beta_start) + beta_start
+    elif beta_schedule == "cosine":
+        s = 0.008
+        steps = num_diffusion_timesteps + 1
+        x = np.linspace(0, steps, steps)
+        alphas_cumprod = np.cos(((x / steps) + s) / (1 + s) * np.pi * 0.5) ** 2
+        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+        betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+        betas = np.clip(betas, a_min=0, a_max=0.999)
     else:
         raise NotImplementedError(beta_schedule)
     assert betas.shape == (num_diffusion_timesteps,)
@@ -532,11 +540,11 @@ class DenoisingDiffusion(object):
         # --- COMBINED LOSS ---
         total_loss = (
             1.0 * noise_loss +            # Main objective for diffusion
-            0.5 * frequency_loss +        # Main objective for HFRM
-            0.1 * loss_physics +
-            0.2 * photo_loss +
-            0.2 * color_loss_val +
-            0.1 * perceptual_loss_val
+            0.8 * frequency_loss +        # Increased
+            0.5 * loss_physics +          # Increased
+            1.0 * photo_loss +            # Increased
+            0.8 * color_loss_val +        # Increased
+            0.5 * perceptual_loss_val     # Increased
         )
 
         return total_loss, noise_loss, frequency_loss, photo_loss, loss_physics, color_loss_val, perceptual_loss_val

@@ -7,7 +7,7 @@ data:
     dwt_levels: 2
     num_workers: 4
     data_dir: "/home/mlr/nihal/underwater/underwaterbenchmarkdataset"
-    ckpt_dir: "ckpt/physics-PA_Diff-v1"
+    ckpt_dir: "ckpt/no-res-standard-ddim-v2"
     conditional: True
     img_prefix: "uieb"
 
@@ -23,10 +23,10 @@ model:
     resamp_with_conv: True
 
 diffusion:
-    beta_schedule: linear
+    beta_schedule: cosine
     beta_start: 0.0001
     beta_end: 0.02
-    num_diffusion_timesteps: 200
+    num_diffusion_timesteps: 1000
 
 training:
     batch_size: 10
@@ -36,7 +36,7 @@ training:
 optim:
     weight_decay: 0.000
     optimizer: "Adam"
-    lr: 0.00001
+    lr: 0.00003
     amsgrad: False
     eps: 0.00000001
     step_size: 50
