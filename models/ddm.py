@@ -142,7 +142,7 @@ class Net(nn.Module):
         # Main U-Net for diffusion
         self.Unet = DiffusionUNet(config)
         # Physics prior generator (transmission + atmospheric maps)
-        self.condition_net = PM(input_channels=3)
+        self.pm = PM(input_channels=3)
 
         betas = get_beta_schedule(
             beta_schedule=config.diffusion.beta_schedule,
@@ -167,41 +167,44 @@ class Net(nn.Module):
         a = (1 - beta).cumprod(dim=0).index_select(0, t + 1).view(-1, 1, 1, 1)
         return a
 
-    def sample_training(self, x_cond, b, eta=0.):
+    def ddim_sample(self, x_cond, a_down, t_map_down, eta=0.0):
+        b = self.betas.to(x_cond.device)
+        n = x_cond.shape[0]
+        
+        # Define the DDIM sampling schedule
         skip = self.config.diffusion.num_diffusion_timesteps // self.args.sampling_timesteps
         seq = range(0, self.config.diffusion.num_diffusion_timesteps, skip)
-        n, c, h, w = x_cond.shape
         seq_next = [-1] + list(seq[:-1])
-        x = torch.randn(n, c, h, w, device=self.device)
-        xs = [x]
+
+        # Start with pure noise
+        x = torch.randn_like(x_cond)
+
+        # Main sampling loop
         for i, j in zip(reversed(seq), reversed(seq_next)):
-            t = (torch.ones(n) * i).to(x.device)
-            next_t = (torch.ones(n) * j).to(x.device)
+            t = (torch.ones(n) * i).to(x_cond.device)
+            next_t = (torch.ones(n) * j).to(x_cond.device)
+            
             at = self.compute_alpha(b, t.long())
             at_next = self.compute_alpha(b, next_t.long())
-            xt = xs[-1].to(x.device)
 
-            # predict physical priors on LL input
-            A_map, t_map = self.condition_net(x_cond)
-            # downsample priors to match LL resolution
-            t_ll = F.interpolate(t_map, size=x_cond.shape[-2:], mode='bilinear', align_corners=False)
-            A_ll = F.interpolate(A_map, size=x_cond.shape[-2:], mode='bilinear', align_corners=False)
-            # concatenate LL input, noise, and priors
-            unet_input = torch.cat([x_cond, xt, t_ll, A_ll], dim=1)
+            # --- U-Net Prediction ---
+            # Predict the noise for the current step
+            unet_input = torch.cat([x_cond, x, a_down, t_map_down], dim=1)
             et = self.Unet(unet_input, t)
-            # t_embed = timestep_embedding(t, 256)
-            # et = self.ICDT(xt, x_cond, t_embed)
-            x0_t = (xt - et * (1 - at).sqrt()) / at.sqrt()
+            # ------------------------
 
+            # Predict the clean image (x0)
+            x0_t = (x - et * (1 - at).sqrt()) / at.sqrt()
+
+            # --- DDIM Update Step ---
+            # This is the core of the DDIM formula
             c1 = eta * ((1 - at / at_next) * (1 - at_next) / (1 - at)).sqrt()
             c2 = ((1 - at_next) - c1 ** 2).sqrt()
-            xt_next = at_next.sqrt() * x0_t + c1 * torch.randn_like(x) + c2 * et
-            xs.append(xt_next.to(x.device))
-
-        # Return residual prediction: denoised LL minus input LL
-        final_pred = xs[-1]
-        residual_pred = final_pred - x_cond
-        return residual_pred
+            x = at_next.sqrt() * x0_t + c2 * et + c1 * torch.randn_like(x)
+            # ------------------------
+            
+        # Return the final denoised LL_LL directly
+        return x
 
     def forward(self, x):
         data_dict = {}
@@ -209,81 +212,75 @@ class Net(nn.Module):
 
         input_img = x[:, :3, :, :]
         n, c, h, w = input_img.shape
+
+        a, t_map = self.pm(input_img)
+        
         input_img_norm = data_transform(input_img)
         input_dwt = dwt(input_img_norm)
 
         input_LL, input_high0 = input_dwt[:n, ...], input_dwt[n:, ...]
-
         input_high0 = self.high_enhance0(input_high0)
 
         input_LL_dwt = dwt(input_LL)
         input_LL_LL, input_high1 = input_LL_dwt[:n, ...], input_LL_dwt[n:, ...]
         input_high1 = self.high_enhance1(input_high1)
 
+        target_size = input_LL_LL.shape[-2:]
+        a_down = F.interpolate(a, size=target_size, mode='bilinear', align_corners=False)
+        t_map_down = F.interpolate(t_map, size=target_size, mode='bilinear', align_corners=False)
+
         b = self.betas.to(input_img.device)
+        t = torch.randint(low=0, high=self.num_timesteps, size=(input_LL_LL.shape[0],)).to(x.device)
+        a_cumprod = (1 - b).cumprod(dim=0).index_select(0, t).view(-1, 1, 1, 1)
 
-        t = torch.randint(low=0, high=self.num_timesteps, size=(input_LL_LL.shape[0] // 2 + 1,)).to(self.device)
-        t = torch.cat([t, self.num_timesteps - t - 1], dim=0)[:input_LL_LL.shape[0]].to(x.device)
-        a = (1 - b).cumprod(dim=0).index_select(0, t).view(-1, 1, 1, 1)
-
-        e = torch.randn_like(input_LL_LL)
+        e = torch.randn_like(input_LL_LL) # This is the ground truth noise
 
         if self.training:
             gt_img_norm = data_transform(x[:, 3:, :, :])
             gt_dwt = dwt(gt_img_norm)
             gt_LL, gt_high0 = gt_dwt[:n, ...], gt_dwt[n:, ...]
-
             gt_LL_dwt = dwt(gt_LL)
             gt_LL_LL, gt_high1 = gt_LL_dwt[:n, ...], gt_LL_dwt[n:, ...]
 
-            x_gt = gt_LL_LL * a.sqrt() + e * (1.0 - a).sqrt()
-            # predict physical priors
-            # predict physical priors from raw hazy image
-            A_map, t_map = self.condition_net(input_img)
-            # downsample priors to LL resolution
-            t_ll = F.interpolate(t_map, size=input_LL_LL.shape[-2:], mode='bilinear', align_corners=False)
-            A_ll = F.interpolate(A_map, size=input_LL_LL.shape[-2:], mode='bilinear', align_corners=False)
-            # save priors for loss computation
-            data_dict['t_map'] = t_map
-            data_dict['A_map'] = A_map
-            # concatenate inputs for Unet
-            unet_input = torch.cat([input_LL_LL, x_gt, t_ll, A_ll], dim=1)
-            noise_output = self.Unet(unet_input, t.float())
-            # t_embed = timestep_embedding(t.float(), 256)
-            # noise_output = self.ICDT(x_gt, input_LL_LL, t_embed)
-            # Residual correction for LL band
-            denoise_residual = self.sample_training(input_LL_LL, b)
-            # Predict clean LL as input + residual
-            pred_LL_LL = input_LL_LL + denoise_residual
+            # --- STANDARD DDPM FORWARD PROCESS ---
+            # 1. Create the noisy image x_t for a random timestep t
+            x_t = gt_LL_LL * a_cumprod.sqrt() + e * (1.0 - a_cumprod).sqrt()
+            
+            # 2. Predict the noise from x_t
+            unet_input = torch.cat([input_LL_LL, x_t, a_down, t_map_down], dim=1)
+            predicted_noise = self.Unet(unet_input, t.float())
+            # --- END OF STANDARD PROCESS ---
 
+            # --- PREDICT x_0 FOR OTHER LOSSES (Optional but recommended) ---
+            # We can also predict the clean image (x_0) from the noise prediction.
+            # This is useful for calculating perceptual, photo, and color losses.
+            pred_LL_LL = (x_t - predicted_noise * (1.0 - a_cumprod).sqrt()) / a_cumprod.sqrt()
+            pred_LL_LL = torch.clamp(pred_LL_LL, -1.0, 1.0) # Clamp to valid range
+            # Reconstruct the full predicted image
             pred_LL = idwt(torch.cat((pred_LL_LL, input_high1), dim=0))
-
             pred_x = idwt(torch.cat((pred_LL, input_high0), dim=0))
             pred_x = inverse_data_transform(pred_x)
+            # -------------------------------------------------------------
 
+            data_dict["predicted_noise"] = predicted_noise
+            data_dict["gt_noise"] = e
+            data_dict["pred_x"] = pred_x # For calculating other losses
+            # Pass through other necessary items for loss calculation
+            data_dict["a"] = a
+            data_dict["t_map"] = t_map
+            # Add missing high-frequency components for loss calculation
             data_dict["input_high0"] = input_high0
             data_dict["input_high1"] = input_high1
             data_dict["gt_high0"] = gt_high0
             data_dict["gt_high1"] = gt_high1
-            data_dict["pred_LL"] = pred_LL
-            data_dict["gt_LL"] = gt_LL
-            data_dict["noise_output"] = noise_output
-            data_dict["pred_x"] = pred_x
-            data_dict["e"] = e
-            # Additional LL-level outputs for residual supervision
-            data_dict["input_LL_LL"] = input_LL_LL
-            data_dict["pred_LL_LL"] = pred_LL_LL
-            data_dict["gt_LL_LL"] = gt_LL_LL
-            data_dict["residual_pred"] = denoise_residual
 
-        else:
-            # Inference: residual on LL
-            denoise_residual = self.sample_training(input_LL_LL, b)
-            pred_LL_LL = input_LL_LL + denoise_residual
+        else: # Inference mode
+            # Call the new DDIM sampler and use its output directly
+            pred_LL_LL = self.ddim_sample(input_LL_LL, a_down, t_map_down)
+            pred_LL_LL = torch.clamp(pred_LL_LL, -1.0, 1.0)
             pred_LL = idwt(torch.cat((pred_LL_LL, input_high1), dim=0))
             pred_x = idwt(torch.cat((pred_LL, input_high0), dim=0))
             pred_x = inverse_data_transform(pred_x)
-
             data_dict["pred_x"] = pred_x
 
         return data_dict
@@ -401,9 +398,9 @@ class DenoisingDiffusion(object):
 
                     output = self.model(x)
 
-                    total_loss, noise_loss, photo_loss, frequency_loss, color_loss_val, perceptual_loss_val, residual_loss  = self.estimation_loss(x, output)
+                    # Unpack returned values from estimation_loss
+                    total_loss, noise_loss, frequency_loss, photo_loss, loss_physics, color_loss_val, perceptual_loss_val = self.estimation_loss(x, output)
 
-                    # loss = noise_loss + photo_loss + frequency_loss
                     loss = total_loss
                     if self.step % 20 == 0:
                         # print("step:{}, lr:{:.6f}, noise_loss:{:.4f}, photo_loss:{:.4f}, frequency_loss:{:.4f}, color_loss:{:.4f}, perceptual_loss:{:.4f}".format(
@@ -423,7 +420,8 @@ class DenoisingDiffusion(object):
                             "frequency_loss": frequency_loss.item(),
                             "color_loss": color_loss_val.item(),
                             "perceptual_loss": perceptual_loss_val.item(),
-                            "residual_loss": residual_loss.item(),
+                            "loss_physics": loss_physics.item(),
+                            # "residual_loss": residual_loss.item(),
                             "total_loss": total_loss.item()
                         })
                     self.optimizer.zero_grad()
@@ -499,82 +497,49 @@ class DenoisingDiffusion(object):
                 }, filename=os.path.join(self.config.data.ckpt_dir, f'model_epoch_{epoch + 1}'))                
 
     def estimation_loss(self, x, output):
-        # Original outputs from the model
-        input_high0, input_high1, gt_high0, gt_high1 = (
-            output["input_high0"], output["input_high1"],
-            output["gt_high0"], output["gt_high1"]
-        )
-
-        pred_LL, gt_LL, pred_x, noise_output, e = (
-            output["pred_LL"], output["gt_LL"],
-            output["pred_x"], output["noise_output"], output["e"]
-        )
-
-        # Ground truth image
         gt_img = x[:, 3:, :, :].to(self.device)
-
-        # ============= Residual Loss ===================
-        # Supervise residual prediction at LL level
-        residual_gt = output["gt_LL_LL"] - output["input_LL_LL"]
-        residual_loss = self.l2_loss(output["residual_pred"], residual_gt)
-        # ============= Noise Loss ===================
-        noise_loss = self.l2_loss(noise_output, e)
-
-        # ============= Frequency Loss ===================
+        
+        # --- PRIMARY NOISE LOSS (Trains the U-Net on the LL_LL band) ---
+        predicted_noise = output["predicted_noise"]
+        gt_noise = output["gt_noise"]
+        noise_loss = self.l2_loss(predicted_noise, gt_noise)
+        
+        # --- FREQUENCY LOSS (Trains the HFRM modules) ---
+        # Get the HFRM inputs and GTs from the data_dict
+        input_high0, input_high1 = output["input_high0"], output["input_high1"]
+        gt_high0, gt_high1 = output["gt_high0"], output["gt_high1"]
+        
         l2_HF = self.l2_loss(input_high0, gt_high0) + self.l2_loss(input_high1, gt_high1)
-        tv_HF = self.TV_loss(input_high0) + self.TV_loss(input_high1)
+        # You can add other HF components like TV_loss or edge_loss if you wish
+        frequency_loss = l2_HF
+        # --------------------------------------------------------
 
-        # Optional: LL supervision can stay light if haze is already solved
-        l2_LL = self.l2_loss(pred_LL, gt_LL)
-        tv_LL = self.TV_loss(pred_LL)
-
-
-        # Edge loss for high-frequency components
-        L_edge = self.edge_loss(input_high0, gt_high0) + self.edge_loss(input_high1, gt_high1)
-
-        frequency_loss = (
-            1.0 * l2_HF +          # ↑ from 0.1 to 1.0
-            0.1 * tv_HF +          # ↑ from 0.01 to 0.1
-            0.2 * l2_LL +          # optional — keep this weaker
-            0.01 * tv_LL           # optional — very light TV on LL
-        )
-        frequency_loss += 0.2 * L_edge
-
-        # ============= Photometric Loss ===================
-        # Content loss (L1)
-        content_loss = self.l1_loss(pred_x, gt_img)
-        # SSIM loss
-        ssim_loss = 1 - ssim(pred_x, gt_img, data_range=1.0).to(self.device)
-        photo_loss = content_loss + ssim_loss
-
-        # ============= Color Loss ===================
-        color_loss_val = self.color_loss(pred_x, gt_img)
-
-        # ============= Perceptual Loss ===================
-        perceptual_loss_val = perceptual_loss(pred_x, gt_img, self.feature_extractor)
-
-        # Combine losses (include residual_loss)
-        total_loss = (
-            residual_loss +
-            noise_loss +
-            0.5 * frequency_loss +
-            0.5 * photo_loss +
-            0.2 * color_loss_val +
-            0.2 * perceptual_loss_val
-        )
-        # Physics reconstruction loss
-        t_map = output['t_map']
-        A_map = output['A_map']
+        # --- OTHER LOSSES (Regularizers on the final image) ---
+        pred_x = output["pred_x"]
+        
+        # Physics Loss
+        a = output["a"]
+        t_map = output["t_map"]
+        reconstructed_hazy = pred_x * t_map + a * (1.0 - t_map)
         input_img = x[:, :3, :, :].to(self.device)
-        recon_hazy = t_map * pred_x + (1.0 - t_map) * A_map
-        recon_loss = self.l1_loss(recon_hazy, input_img)
-        # Smoothness regularization on transmission map
-        tv_reg = torch.mean(torch.abs(t_map[:, :, :, :-1] - t_map[:, :, :, 1:])) + \
-                 torch.mean(torch.abs(t_map[:, :, :-1, :] - t_map[:, :, 1:, :]))
-        total_loss = total_loss + 0.5 * recon_loss + 0.01 * tv_reg
+        loss_physics = self.l1_loss(reconstructed_hazy, input_img)
 
-        return total_loss, noise_loss, photo_loss, frequency_loss, color_loss_val, perceptual_loss_val, residual_loss
+        # Photo, Color, and Perceptual Losses
+        photo_loss = self.l1_loss(pred_x, gt_img) + (1 - ssim(pred_x, gt_img, data_range=1.0))
+        color_loss_val = self.color_loss(pred_x, gt_img)
+        perceptual_loss_val = perceptual_loss(pred_x, gt_img, self.feature_extractor)
+        
+        # --- COMBINED LOSS ---
+        total_loss = (
+            1.0 * noise_loss +            # Main objective for diffusion
+            0.5 * frequency_loss +        # Main objective for HFRM
+            0.1 * loss_physics +
+            0.2 * photo_loss +
+            0.2 * color_loss_val +
+            0.1 * perceptual_loss_val
+        )
 
+        return total_loss, noise_loss, frequency_loss, photo_loss, loss_physics, color_loss_val, perceptual_loss_val
 
     def sample_validation_patches(self, val_loader, step):
         image_folder = os.path.join(self.args.image_folder, self.config.data.type + str(self.config.data.patch_size))
